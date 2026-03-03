@@ -5,19 +5,24 @@ This is a Machine Learning Website Classification application. It classifies web
 ✨ Features
 
 ✅ End-to-end ML pipeline: EDA → Preprocessing → Training → Testing → Deployment
-🌐 Interactive web app with Streamlit
-⚡ Real-time website category prediction
-📦 Supports .pkl model and label encoder files
-🧠 How the Model Works
 
+🌐 Interactive web app with Streamlit
+
+⚡ Real-time website category prediction
+
+📦 Supports .pkl model and label encoder files
+
+🧠 How the Model Works-
 The model uses TfidfVectorizer to convert website content into numerical features, then a Support Vector Machine (SVM) classifier predicts the website category. User input is preprocessed before prediction.
+
 
 🛠 How to Run
 
 Clone the repository:
 
-git clone <your-github-repo-link>
+git clone <https://github.com/Sananda-Dutta/website-category-classifier>
 cd website-classification
+
 
 Install dependencies:
 
@@ -29,12 +34,19 @@ streamlit run app.py
 
 Enter the website input in the app and see the predicted category.
 
+
 📂 Project Files
+
 File	Description
+
 app.py	Streamlit application
+
 website_classifier.pkl	Trained ML model
+
 label_encoder.pkl	Label encoder for categories
+
 requirements.txt	Python dependencies
+
 
 🛠 Technologies Used
 
@@ -45,6 +57,7 @@ scikit-learn
 pandas, numpy
 
 Streamlit
+
 
 ✍️ Author
 
