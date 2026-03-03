@@ -5,13 +5,9 @@ This is a Machine Learning Website Classification application. It classifies web
 ✨ Features
 
 ✅ End-to-end ML pipeline: EDA → Preprocessing → Training → Testing → Deployment
-
 🌐 Interactive web app with Streamlit
-
 ⚡ Real-time website category prediction
-
 📦 Supports .pkl model and label encoder files
-
 🧠 How the Model Works
 
 The model uses TfidfVectorizer to convert website content into numerical features, then a Support Vector Machine (SVM) classifier predicts the website category. User input is preprocessed before prediction.
