@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+torch
+transformers
+pandas
+numpy
+requests
+beautifulsoup4
+lxml
+slowapi
+python-multipart
+huggingface_hub
+lime
