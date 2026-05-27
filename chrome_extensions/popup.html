@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Website Category Classifier</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+
+  <!-- ── Header ── -->
+  <div class="header">
+    <span class="header-icon">🌐</span>
+    <div>
+      <div class="header-title">Website Classifier</div>
+      <div class="header-sub">DistilBERT · 11 categories</div>
+    </div>
+    <div id="api-status" class="status-dot status-unknown" title="API status"></div>
+  </div>
+
+  <!-- ── Current URL display ── -->
+  <div class="url-bar" id="url-bar">
+    <span id="current-url">Loading...</span>
+  </div>
+
+  <!-- ── Loading state ── -->
+  <div id="state-loading" class="state">
+    <div class="spinner"></div>
+    <div class="loading-text">Classifying...</div>
+    <div class="loading-sub">First request may take 30s (cold start)</div>
+  </div>
+
+  <!-- ── Error state ── -->
+  <div id="state-error" class="state hidden">
+    <div class="error-icon">⚠️</div>
+    <div class="error-text" id="error-text">Could not reach API</div>
+    <button class="btn-retry" id="btn-retry">Retry</button>
+  </div>
+
+  <!-- ── Unsupported URL state ── -->
+  <div id="state-unsupported" class="state hidden">
+    <div class="error-icon">🚫</div>
+    <div class="error-text">Cannot classify this page</div>
+    <div class="loading-sub">Navigate to a real website to classify it</div>
+  </div>
+
+  <!-- ── Result state ── -->
+  <div id="state-result" class="state hidden">
+
+    <!-- Main prediction card -->
+    <div class="result-card" id="result-card">
+      <div class="result-label">Predicted Category</div>
+      <div class="result-main">
+        <span id="result-emoji">🌐</span>
+        <span id="result-category">—</span>
+      </div>
+      <div class="result-meta">
+        <span class="badge badge-model">DistilBERT</span>
+        <span class="badge badge-conf" id="badge-conf">—% confidence</span>
+        <span class="badge badge-time" id="badge-time">— ms</span>
+      </div>
+    </div>
+
+    <!-- Safety verdict -->
+    <div class="verdict-bar" id="verdict-bar">
+      <span id="verdict-text">—</span>
+    </div>
+
+    <!-- Safety metrics row -->
+    <div class="metrics-row">
+      <div class="metric">
+        <div class="metric-val" id="met-safe">—</div>
+        <div class="metric-label">Ad Safe</div>
+      </div>
+      <div class="metric">
+        <div class="metric-val" id="met-kids">—</div>
+        <div class="metric-label">Kids Safe</div>
+      </div>
+      <div class="metric">
+        <div class="metric-val" id="met-sfk">—</div>
+        <div class="metric-label">Safe for Kids</div>
+      </div>
+    </div>
+
+    <!-- Top 3 predictions -->
+    <div class="section-title">Top 3 predictions</div>
+    <div id="top3-list"></div>
+
+    <!-- Method + reclassify -->
+    <div class="footer-row">
+      <span class="method-badge" id="method-badge">—</span>
+      <button class="btn-reclassify" id="btn-reclassify">↺ Reclassify</button>
+    </div>
+
+  </div>
+
+  <!-- ── Footer ── -->
+  <div class="ext-footer">
+    Built by <a href="https://huggingface.co/SanandaDutta" target="_blank">SanandaDutta</a>
+    · <a href="https://website-category-classifier.onrender.com/docs" target="_blank">API docs</a>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
