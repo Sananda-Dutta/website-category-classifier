@@ -408,34 +408,43 @@ def run_prediction(feature_string: str):
     Returns (category, confidence_%, top3_list)
     Cached for 1000 unique inputs — speeds up repeated URLs.
     """
+
     enc = tokenizer(
         feature_string,
-        truncation    = True,
-        max_length    = 512,
-        padding       = True,
-        return_tensors= "pt"
-    ).to(device)
+        truncation=True,
+        max_length=512,
+        padding=True,
+        return_tensors="pt"
+    )
+
+    # Move tensors to device
+    enc = {k: v.to(device) for k, v in enc.items()}
+
+    # DistilBERT does NOT use token_type_ids
+    enc.pop("token_type_ids", None)
 
     with torch.no_grad():
         logits = model(**enc).logits
 
-    probs    = torch.softmax(logits, dim=-1)[0].cpu().numpy()
+    probs = torch.softmax(logits, dim=-1)[0].cpu().numpy()
+
     top3_idx = np.argsort(probs)[::-1][:3]
 
     top3 = [
         {
-            "category":   CLASS_NAMES[i],
-            "confidence": round(float(probs[i]) * 100, 1)
+            "category": CLASS_NAMES[i],
+            "confidence": round(float(probs[i] * 100), 2)
         }
         for i in top3_idx
     ]
 
-    best_idx   = int(np.argmax(probs))
-    category   = CLASS_NAMES[best_idx]
-    confidence = round(float(probs[best_idx]) * 100, 1)
+    pred_idx = int(np.argmax(probs))
+
+    category = CLASS_NAMES[pred_idx]
+
+    confidence = round(float(probs[pred_idx] * 100), 2)
 
     return category, confidence, top3
-
 
 def predict_proba_batch(texts: List[str]) -> np.ndarray:
     """
