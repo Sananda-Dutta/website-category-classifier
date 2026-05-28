@@ -1,32 +1,64 @@
 // ═══════════════════════════════════════════════════════════════
-// popup.js  —  Website Category Classifier Extension  v1.0.0
-// Calls /safe-check (gives category + confidence + safety in one
-// request) then renders Top 3 from a second /classify/url call.
+// popup.js  —  v1.1.0
+//
+// v1.1.0 fixes:
+//   - normalizeUrl() applied before API calls — fixes YouTube
+//     /watch?v= and any other query-param-heavy URLs
+//   - 404 / 422 responses handled with friendly messages
+//     instead of raw FastAPI error strings
+//   - Local shortcuts checked first — popup is instant for
+//     YouTube, Instagram, etc. without waiting for API
+//   - Error messages are human-readable in all cases
 // ═══════════════════════════════════════════════════════════════
 
 const API_BASE = "https://website-category-classifier.onrender.com";
 
 const CATEGORY_EMOJI = {
-  Adult: "🔞", Arts: "🎨", Business: "💼", Education: "🎓",
-  Gaming: "🎮", Health: "🏥", Kids: "👧", Lifestyle: "🏠",
-  News: "📰", Recreation: "🏕️", Technology: "💻",
-  Unknown: "🌐", Error: "❌",
+  Adult:"🔞", Arts:"🎨", Business:"💼", Education:"🎓",
+  Gaming:"🎮", Health:"🏥", Kids:"👧", Lifestyle:"🏠",
+  News:"📰", Recreation:"🏕️", Technology:"💻",
+  Unknown:"🌐", Error:"❌",
 };
 
-// ── DOM refs ──────────────────────────────────────────────────
+// Mirror of background.js LOCAL_SHORTCUTS
+const LOCAL_SHORTCUTS = {
+  "youtube.com":"Arts",   "youtu.be":"Arts",
+  "netflix.com":"Arts",   "primevideo.com":"Arts",
+  "hotstar.com":"Arts",   "disneyplus.com":"Arts",
+  "zee5.com":"Arts",      "sonyliv.com":"Arts",
+  "twitch.tv":"Gaming",   "instagram.com":"Lifestyle",
+  "twitter.com":"News",   "x.com":"News",
+  "facebook.com":"News",  "linkedin.com":"Business",
+  "reddit.com":"News",    "pinterest.com":"Lifestyle",
+  "amazon.com":"Business","amazon.in":"Business",
+  "flipkart.com":"Business","meesho.com":"Business",
+  "ndtv.com":"News",      "bbc.com":"News","bbc.co.uk":"News",
+  "cricbuzz.com":"Recreation","github.com":"Technology",
+  "byjus.com":"Education","wikipedia.org":"Education",
+  "practo.com":"Health",  "gaana.com":"Arts",
+  "spotify.com":"Arts",   "dream11.com":"Gaming",
+  "zomato.com":"Lifestyle","swiggy.com":"Lifestyle",
+};
+
+// ── Helpers ───────────────────────────────────────────────────
 const $ = id => document.getElementById(id);
 
-const states = {
-  loading:     $("state-loading"),
-  error:       $("state-error"),
-  unsupported: $("state-unsupported"),
-  result:      $("state-result"),
-};
+function normalizeUrl(url) {
+  try {
+    const u = new URL(url);
+    return `${u.protocol}//${u.hostname}${u.pathname}`.replace(/\/$/, "");
+  } catch { return url; }
+}
 
-// ── Show exactly one state panel ─────────────────────────────
+function getDomain(url) {
+  try { return new URL(url).hostname.replace(/^www\./, ""); }
+  catch { return ""; }
+}
+
 function showState(name) {
-  Object.entries(states).forEach(([k, el]) => {
-    el.classList.toggle("hidden", k !== name);
+  ["loading","error","unsupported","result"].forEach(s => {
+    $(s === name ? `state-${s}` : `state-${s}`)
+      .classList.toggle("hidden", s !== name);
   });
 }
 
@@ -34,10 +66,9 @@ function showState(name) {
 async function checkApiStatus() {
   const dot = $("api-status");
   try {
-    const res = await fetch(`${API_BASE}/health`, { signal: AbortSignal.timeout(6000) });
-    dot.className = res.ok
-      ? "status-dot status-online"
-      : "status-dot status-offline";
+    const res = await fetch(`${API_BASE}/health`,
+      { signal: AbortSignal.timeout(6000) });
+    dot.className = `status-dot ${res.ok ? "status-online" : "status-offline"}`;
   } catch {
     dot.className = "status-dot status-offline";
   }
@@ -47,30 +78,26 @@ async function checkApiStatus() {
 function renderTop3(top3) {
   const container = $("top3-list");
   container.innerHTML = "";
-
   top3.forEach((item, i) => {
-    const emoji = CATEGORY_EMOJI[item.category] || "🌐";
-    const pct   = item.confidence;
-
     const row = document.createElement("div");
     row.className = "top3-item";
     row.innerHTML = `
-      <span class="top3-label">${emoji} ${item.category}</span>
+      <span class="top3-label">
+        ${CATEGORY_EMOJI[item.category]||"🌐"} ${item.category}
+      </span>
       <div class="top3-bar-track">
-        <div class="top3-bar-fill ${i === 0 ? "top1" : ""}"
-             style="width:${pct}%"></div>
+        <div class="top3-bar-fill ${i===0?"top1":""}"
+             style="width:${item.confidence}%"></div>
       </div>
-      <span class="top3-pct">${pct}%</span>
-    `;
+      <span class="top3-pct">${item.confidence}%</span>`;
     container.appendChild(row);
   });
 }
 
-// ── Render safety verdict bar ─────────────────────────────────
+// ── Render safety verdict ─────────────────────────────────────
 function renderVerdict(data) {
   const bar = $("verdict-bar");
-  bar.className = "verdict-bar";   // reset classes
-
+  bar.className = "verdict-bar";
   if (data.adult_flag) {
     bar.classList.add("verdict-unsafe");
     bar.textContent = "🔴 ADULT — block recommended";
@@ -84,136 +111,144 @@ function renderVerdict(data) {
     bar.classList.add("verdict-safe");
     bar.textContent = "🟢 SAFE";
   }
-
-  $("met-safe").textContent  = data.safe          ? "✅ Yes" : "🚫 No";
-  $("met-kids").textContent  = data.kids_safe      ? "✅ Yes" : "🚫 No";
-  $("met-sfk").textContent   = data.safe_for_kids  ? "✅ Yes" : "🚫 No";
+  $("met-safe").textContent = data.safe         ? "✅ Yes" : "🚫 No";
+  $("met-kids").textContent = data.kids_safe    ? "✅ Yes" : "🚫 No";
+  $("met-sfk").textContent  = data.safe_for_kids? "✅ Yes" : "🚫 No";
 }
 
-// ── Main classify + render flow ───────────────────────────────
-async function classifyCurrentTab(url) {
+// ── Show result from local shortcut (instant, no API) ─────────
+function showLocalShortcut(url, category) {
+  const safeForKids = ["Education","Kids","Arts","Recreation"].includes(category);
+  const isAdult     = category === "Adult";
+
+  $("result-emoji").textContent    = CATEGORY_EMOJI[category] || "🌐";
+  $("result-category").textContent = category;
+  $("badge-conf").textContent      = "99% confidence";
+  $("badge-time").textContent      = "instant";
+  $("method-badge").textContent    = "Domain shortcut";
+
+  renderVerdict({
+    adult_flag:    isAdult,
+    kids_safe:     category === "Kids",
+    safe_for_kids: safeForKids,
+    safe:          !isAdult,
+  });
+
+  renderTop3([{ category, confidence: 99 }]);
+  showState("result");
+}
+
+// ── Human-readable error messages ────────────────────────────
+function friendlyError(status, message) {
+  if (!navigator.onLine)
+    return "No internet connection.";
+  if (status === 404 || message?.includes("not found") || message?.includes("Not Found"))
+    return "This page could not be classified — it may require login or block scrapers.";
+  if (status === 422)
+    return "Could not extract content from this URL. Try a simpler page URL.";
+  if (status === 429)
+    return "Too many requests — wait 1 minute and retry.";
+  if (status >= 500)
+    return "API server error. Check render.com status or retry in 30 seconds.";
+  if (message?.includes("timeout") || message?.includes("TimeoutError"))
+    return "Request timed out — API may be waking up (cold start). Retry in 30 seconds.";
+  return message || "Could not reach API.";
+}
+
+// ── Main classify flow ────────────────────────────────────────
+async function classifyUrl(originalUrl) {
   showState("loading");
 
+  const domain      = getDomain(originalUrl);
+  const normalUrl   = normalizeUrl(originalUrl);
+
+  // ── 1. Check local shortcuts first — instant result ───────
+  if (LOCAL_SHORTCUTS[domain]) {
+    showLocalShortcut(originalUrl, LOCAL_SHORTCUTS[domain]);
+    return;
+  }
+
   try {
-    // ── Call /safe-check → gives category + safety in one shot ──
+    // ── 2. /safe-check with normalized URL ────────────────
     const safeRes = await fetch(`${API_BASE}/safe-check`, {
       method:  "POST",
       headers: { "Content-Type": "application/json" },
-      body:    JSON.stringify({ url }),
-      signal:  AbortSignal.timeout(40000),   // 40s — Render cold start
+      body:    JSON.stringify({ url: normalUrl }),
+      signal:  AbortSignal.timeout(40000),
     });
 
     if (!safeRes.ok) {
-      const err = await safeRes.json().catch(() => ({}));
-      throw new Error(err.detail || `API error ${safeRes.status}`);
+      let detail = "";
+      try { detail = (await safeRes.json()).detail || ""; } catch {}
+      throw { status: safeRes.status, message: detail };
     }
 
     const safeData = await safeRes.json();
 
-    // ── Call /classify/url to get Top 3 ──────────────────────
+    // ── 3. /classify/url for Top 3 ────────────────────────
     const classRes = await fetch(`${API_BASE}/classify/url`, {
       method:  "POST",
       headers: { "Content-Type": "application/json" },
-      body:    JSON.stringify({ url }),
+      body:    JSON.stringify({ url: normalUrl }),
       signal:  AbortSignal.timeout(40000),
     });
-
     const classData = classRes.ok ? await classRes.json() : null;
 
-    // ── Render result card ────────────────────────────────────
+    // ── 4. Render ──────────────────────────────────────────
     const category   = safeData.category   || "Unknown";
     const confidence = safeData.confidence || 0;
-    const method     = safeData.method     || "ml_model";
     const timeMs     = safeData.time_ms    || "—";
-    const emoji      = CATEGORY_EMOJI[category] || "🌐";
+    const method     = safeData.method     || "ml_model";
 
-    $("result-emoji").textContent    = emoji;
+    $("result-emoji").textContent    = CATEGORY_EMOJI[category] || "🌐";
     $("result-category").textContent = category;
     $("badge-conf").textContent      = `${confidence}% confidence`;
     $("badge-time").textContent      = `${timeMs} ms`;
     $("method-badge").textContent    = method === "domain_shortcut"
-      ? "Domain shortcut"
-      : "DistilBERT";
+      ? "Domain shortcut" : "DistilBERT";
 
     renderVerdict(safeData);
+    renderTop3(classData?.top3 || [{ category, confidence }]);
 
-    // Top 3 — use classify/url response if available, else fake it
-    const top3 = classData?.top3 || [
-      { category, confidence }
-    ];
-    renderTop3(top3);
-
-    // ── Cache result for badge (background.js reads this) ────
+    // Cache for background.js badge
     chrome.storage.local.set({
-      [`cache:${url}`]: {
-        category,
-        confidence,
-        timestamp: Date.now(),
-      }
+      [`cache:${normalUrl}`]: { category, confidence, timestamp: Date.now() }
     });
 
     showState("result");
 
   } catch (err) {
-    $("error-text").textContent = err.message.includes("timeout")
-      ? "Request timed out — API may be waking up. Click retry in 30s."
-      : err.message || "Could not reach API";
+    $("error-text").textContent = friendlyError(err.status, err.message);
     showState("error");
   }
 }
 
-// ── Retry button ──────────────────────────────────────────────
-$("btn-retry").addEventListener("click", () => {
+// ── Retry / Reclassify buttons ────────────────────────────────
+function getCurrentUrl(cb) {
   chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
-    const url = tabs[0]?.url;
-    if (url) classifyCurrentTab(url);
+    cb(tabs[0]?.url || "");
   });
-});
+}
 
-// ── Reclassify button ─────────────────────────────────────────
-$("btn-reclassify").addEventListener("click", () => {
-  chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
-    const url = tabs[0]?.url;
-    if (url) classifyCurrentTab(url);
-  });
-});
+$("btn-retry").addEventListener("click", () =>
+  getCurrentUrl(url => { if (url) classifyUrl(url); }));
+
+$("btn-reclassify").addEventListener("click", () =>
+  getCurrentUrl(url => { if (url) classifyUrl(url); }));
 
 // ── Entry point ───────────────────────────────────────────────
 document.addEventListener("DOMContentLoaded", () => {
+  checkApiStatus();
 
-  checkApiStatus();   // ping /health for the status dot
-
-  chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
-    const tab = tabs[0];
-    const url = tab?.url || "";
-
-    // Show URL in the bar (truncated)
+  getCurrentUrl(url => {
     const display = url.replace(/^https?:\/\/(www\.)?/, "").slice(0, 55);
     $("current-url").textContent = display || "—";
 
-    // Only classify real http/https pages
     if (!url.startsWith("http://") && !url.startsWith("https://")) {
       showState("unsupported");
       return;
     }
 
-    // Check cache first (5 min TTL) — avoids re-calling API on re-open
-    chrome.storage.local.get([`cache:${url}`], result => {
-      const cached = result[`cache:${url}`];
-      const TTL    = 5 * 60 * 1000;   // 5 minutes
-
-      if (cached && (Date.now() - cached.timestamp) < TTL) {
-        // Serve from cache — still show full result by re-classifying silently
-        // but show cached badge immediately
-        $("result-emoji").textContent    = CATEGORY_EMOJI[cached.category] || "🌐";
-        $("result-category").textContent = cached.category;
-        $("badge-conf").textContent      = `${cached.confidence}% confidence`;
-        $("badge-time").textContent      = "cached";
-        $("method-badge").textContent    = "cached";
-      }
-
-      // Always fetch fresh data (cache just prevents blank flash)
-      classifyCurrentTab(url);
-    });
+    classifyUrl(url);
   });
 });
