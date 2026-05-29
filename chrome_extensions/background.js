@@ -133,8 +133,29 @@ function setCache(url, category, confidence) {
 
 // ── Main classify function ────────────────────────────────────
 async function classifyTab(tabId, url) {
+  if (
+    url.startsWith("chrome://") ||
+    url.startsWith("edge://") ||
+    url.startsWith("about:") ||
+    url.startsWith("file://") ||
+    url.includes("localhost") ||
+    url.includes("127.0.0.1")
+  ) {
+    return;
+  }
   if (!url || !url.startsWith("http")) {
     clearBadge(tabId);
+    return;
+  }
+  const BLOCKED_DOMAINS = [
+    "chatgpt.com",
+    "openai.com",
+    "bing.com",
+    "msn.com",
+    "render.com"
+  ];
+
+  if (BLOCKED_DOMAINS.some(d => url.includes(d))) {
     return;
   }
 

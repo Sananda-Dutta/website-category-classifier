@@ -48,6 +48,7 @@ from huggingface_hub import hf_hub_download
 
 from rate_limiter import limiter
 from scraper import scrape_website, build_feature_string
+from urllib.parse import urlparse
 
 # ─────────────────────────────────────────────
 # CONFIG
@@ -67,7 +68,14 @@ model       = None
 CLASS_NAMES = []
 device      = None
 
+def normalize_domain(url: str):
+    parsed = urlparse(url)
 
+    domain = parsed.netloc.lower()
+
+    domain = domain.replace("www.", "")
+
+    return domain
 # ─────────────────────────────────────────────
 # SQLITE LOGGING
 # Every API call is logged with full detail.
@@ -344,6 +352,33 @@ DOMAIN_SHORTCUTS = {
     "pratilipi.com": "Arts",
     "rekhta.org": "Arts",
     "bookmyshow.com": "Arts",
+    # ── Video / Streaming ──
+    "youtube.com":       "Arts",
+    "youtu.be":          "Arts",
+    "netflix.com":       "Arts",
+    "primevideo.com":    "Arts",
+    "hotstar.com":       "Arts",
+    "disneyplus.com":    "Arts",
+    "zee5.com":          "Arts",
+    "sonyliv.com":       "Arts",
+    "voot.com":          "Arts",
+    "twitch.tv":         "Gaming",
+    
+    # ── Social ──
+    "instagram.com":     "Lifestyle",
+    "twitter.com":       "News",
+    "x.com":             "News",
+    "facebook.com":      "News",
+    "linkedin.com":      "Business",
+    "reddit.com":        "News",
+    
+    # ── E-commerce ──
+    "amazon.com":        "Business",
+    "amazon.in":         "Business",
+    "ebay.com":          "Business",
+    "meesho.com":        "Business",
+    "myntra.com":        "Business",
+    "ajio.com":          "Business",
 }
 
 
@@ -445,6 +480,7 @@ def run_prediction(feature_string: str):
     confidence = round(float(probs[pred_idx] * 100), 2)
 
     return category, confidence, top3
+
 
 def predict_proba_batch(texts: List[str]) -> np.ndarray:
     """
@@ -760,7 +796,7 @@ async def safe_check(request: Request, body: URLRequest):
             raise HTTPException(422, "Invalid URL format.")
 
         domain = get_domain(url)
-
+        domain = normalize_domain(url)
         if domain in DOMAIN_SHORTCUTS:
             category   = DOMAIN_SHORTCUTS[domain]
             confidence = 99.0
@@ -1019,3 +1055,27 @@ async def export_logs():
 
     except Exception as e:
         raise HTTPException(500, f"Export error: {str(e)}")
+
+# ============================================================
+# HEALTH / KEEPALIVE ROUTES
+# ============================================================
+
+@app.get("/")
+def root():
+    return {
+        "message": "Website Category Classifier API is live"
+    }
+
+
+@app.get("/ping")
+def ping():
+    return {
+        "status": "alive"
+    }
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok"
+    }
