@@ -1,8 +1,20 @@
+# Python
 venv/
 __pycache__/
 *.pyc
-.env
+
+# Jupyter
 .ipynb_checkpoints/
-distilbert_final/
-*.zip
-*.csv
+
+# Database
+*.db
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Environment
+.env
