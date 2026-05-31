@@ -208,17 +208,49 @@ def log_request(
 # ─────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("=" * 55)
-    print("Website Category Classifier API  v2.3.0")
-    print("=" * 55)
+    global tokenizer, model, CLASS_NAMES, device
+
     init_db()
-    print("SQLite ready — port opening")
-    print("Model loads on first classify request")
-    print("=" * 55)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Load at startup — not on first request
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(HF_MODEL_ID)
+        model = AutoModelForSequenceClassification.from_pretrained(
+            HF_MODEL_ID, low_cpu_mem_usage=True
+        )
+        labels_path = hf_hub_download(repo_id=HF_MODEL_ID, filename="label_classes.csv")
+    except Exception:
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
+        model = AutoModelForSequenceClassification.from_pretrained(
+            MODEL_DIR, low_cpu_mem_usage=True
+        )
+        labels_path = os.path.join(MODEL_DIR, "label_classes.csv")
+
+    model.to(device)
+    model.eval()
+
+    # Quantize on CPU for speed
+    if device.type == "cpu":
+        model = torch.quantization.quantize_dynamic(
+            model, {torch.nn.Linear}, dtype=torch.qint8
+        )
+
+    # Load labels
+    with open(labels_path, newline="", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        next(reader, None)
+        CLASS_NAMES = [row[0].strip() for row in reader if row and row[0].strip()]
+
+    # Warmup
+    dummy = tokenizer("warmup", return_tensors="pt", truncation=True, max_length=256).to(device)
+    with torch.no_grad():
+        model(**dummy)
+
+    print("🟢 API ready")
     yield
-    print("Shutting down...")
-
-
+    print("🔴 Shutting down")
+    
 # ─────────────────────────────────────────────
 # APP
 # ─────────────────────────────────────────────
@@ -235,6 +267,36 @@ app = FastAPI(
     version  = "2.3.0",
     lifespan = lifespan,
 )
+# 1. Grab the secret you just set on Render
+# If the variable isn't set, it defaults to an empty string (disabled)
+RAPIDAPI_SECRET = os.getenv("RAPIDAPI_PROXY_SECRET", "")
+
+@app.middleware("http")
+async def verify_rapidapi_proxy(request: Request, call_next):
+    """
+    Checks if the request has the correct secret header from RapidAPI.
+    """
+    # 2. List of paths that DON'T need a secret (so you can still test/monitor)
+    skip_paths = {"/health", "/docs", "/openapi.json", "/redoc", "/"}
+
+    # 3. Only enforce check if we have a secret set and path isn't skipped
+    if RAPIDAPI_SECRET and request.url.path not in skip_paths:
+        incoming_header = request.headers.get("X-RapidAPI-Proxy-Secret", "")
+        
+        if incoming_header != RAPIDAPI_SECRET:
+            return JSONResponse(
+                status_code=403,
+                content={"error": "Access via RapidAPI only. Sign up at rapidapi.com"}
+            )
+            
+    return await call_next(request)
+
+# Place this after the verify_rapidapi_proxy middleware
+@app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
+@app.api_route("/ping", methods=["GET", "HEAD"], include_in_schema=False)
+@app.api_route("/health", methods=["GET", "HEAD"], include_in_schema=False)
+async def health_check(request: Request):
+    return {"status": "ok", "message": "Website Category Classifier API 🚀"}
 
 app.add_middleware(
     CORSMiddleware,
@@ -1054,3 +1116,26 @@ async def export_logs():
 
     except Exception as e:
         raise HTTPException(500, f"Export error: {str(e)}")
+
+@app.get("/usage", tags=["Info"])
+async def usage_info():
+    """
+    Returns API capabilities summary — shown in RapidAPI's endpoint explorer.
+    """
+    return {
+        "name":        "Website Category Classifier",
+        "version":     "2.1.0",
+        "categories":  CLASS_NAMES,
+        "endpoints": {
+            "POST /classify/url":  "Classify a live website by URL (scrapes + predicts)",
+            "POST /classify/text": "Classify raw text input",
+            "POST /classify/batch":"Classify up to 20 URLs at once",
+            "POST /safe-check":    "Brand safety verdict — Adult flags, Kids Safe",
+            "GET  /explain":       "LIME XAI — which words drove the prediction",
+        },
+        "rate_limits": {
+            "free":  "100 calls/month",
+            "basic": "5,000 calls/month",
+            "pro":   "50,000 calls/month",
+        }
+    }
