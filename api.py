@@ -1,33 +1,35 @@
 # ═══════════════════════════════════════════════════════════════════════════════
-# Website Category Classifier API  —  v2.1.0
+# Website Category Classifier API  —  v2.0.0
 # Model   : DistilBERT fine-tuned (11 categories)
 # Author  : SanandaDutta
 # HF Repo : SanandaDutta/website-category-distilbert
 # Render  : website-category-classifier.onrender.com
 #
-# Memory optimisations (v2.1.0):
-#   • pandas removed — csv.reader used for label loading (saves ~30 MB)
-#   • LIME imported lazily inside /explain only (saves ~50–80 MB at idle)
-#   • predict_proba_batch defined lazily (not bound at import time)
-#   • Model loaded with low_cpu_mem_usage=True (halves peak RAM during load)
-#   • lru_cache size reduced 100→50; feature strings capped at 1 000 chars
-#     before caching (each slot is now much smaller)
-#   • numpy kept only for argmax/argsort (torch used for softmax)
-#   • Duplicate route handlers removed (/ and /health were defined twice)
-#   • All endpoints, safety logic, and LIME XAI fully preserved
+# Endpoints (Layer 3 — Roadmap):
+#   POST /classify/url     — scrape + predict, domain shortcuts
+#   POST /classify/text    — raw text input, real probabilities
+#   POST /classify/batch   — up to 20 URLs, CSV export built-in
+#   POST /safe-check       — Adult/Kids safety flag + verdict
+#   GET  /explain          — LIME word-level XAI explanation
+#
+# Infra (Layer 4 — Roadmap):
+#   SQLite logging         — every call tracked
+#   Rate limiting          — 30 req/min per IP (slowapi)
+#   HuggingFace Hub        — model hosted free
+#   LRU cache              — repeated URLs served instantly
+#   Render + cron ping     — 24/7 uptime
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # ─────────────────────────────────────────────
-# IMPORTS  (keep this section lean)
+# IMPORTS
 # ─────────────────────────────────────────────
 import os
 import re
-import csv
 import sqlite3
 import time
 import torch
 import numpy as np
-import asyncio
+import pandas as pd
 
 from functools import lru_cache
 from datetime import datetime
@@ -46,81 +48,38 @@ from huggingface_hub import hf_hub_download
 
 from rate_limiter import limiter
 from scraper import scrape_website, build_feature_string
-
-# NOTE: lime is NOT imported here.  It is imported lazily inside /explain
-# only when that endpoint is actually called, saving ~50–80 MB of idle RAM.
+from urllib.parse import urlparse
 
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
 HF_MODEL_ID = "SanandaDutta/website-category-distilbert"
-MODEL_DIR   = "./distilbert_final"
-DB_FILE     = "usage_logs.db"
+MODEL_DIR   = "./distilbert_final"       # local fallback
+DB_FILE     = "usage_logs.db"           # SQLite (replaces CSV — survives restarts)
 
+# Safety flags for /safe-check
 ADULT_CATEGORIES = {"Adult"}
 KIDS_CATEGORY    = "Kids"
 SAFE_FOR_KIDS    = {"Education", "Kids", "Arts", "Recreation"}
 
-# Maximum characters fed into the model / stored in cache.
-# Keeps each lru_cache slot small and reduces tokeniser work.
-MAX_FEATURE_CHARS = 1_000
-
 # Global state
 tokenizer   = None
 model       = None
-CLASS_NAMES: List[str] = []
+CLASS_NAMES = []
 device      = None
 
-
-# ─────────────────────────────────────────────
-# HELPERS — URL / domain
-# ─────────────────────────────────────────────
-def normalize_domain(url: str) -> str:
+def normalize_domain(url: str):
     parsed = urlparse(url)
-    return parsed.netloc.lower().replace("www.", "")
 
-def get_domain(url: str) -> str:
-    parsed = urlparse(url if url.startswith("http") else "https://" + url)
-    return parsed.netloc.replace("www.", "").lower()
+    domain = parsed.netloc.lower()
 
-def is_valid_url(url: str) -> bool:
-    pattern = re.compile(
-        r'^(https?://)?'
-        r'(([a-zA-Z0-9\-]+\.)+[a-zA-Z]{2,})'
-        r'(/.*)?$'
-    )
-    return bool(re.match(pattern, url))
+    domain = domain.replace("www.", "")
 
-def get_ip(request: Request) -> str:
-    forwarded = request.headers.get("x-forwarded-for")
-    return forwarded.split(",")[0].strip() if forwarded else (
-        request.client.host if request.client else "unknown"
-    )
-
-def extract_url_features(url: str) -> str:
-    try:
-        parsed       = urlparse(url if url.startswith("http") else "http://" + url)
-        domain       = parsed.netloc.replace("www.", "")
-        path         = parsed.path
-        tld          = domain.split(".")[-1] if "." in domain else ""
-        domain_words = re.split(r'[.\-_]', domain)
-        path_words   = re.split(r'[/\-_.]', path)
-        tld_signal = {
-            "edu": "education university college academic",
-            "gov": "government official public authority",
-            "org": "organization nonprofit charity",
-            "ac":  "academic university college",
-            "mil": "military government defense",
-        }.get(tld, "")
-        all_parts = domain_words * 3 + path_words + tld_signal.split()
-        clean     = [w.lower() for w in all_parts if len(w) > 2 and w.isalpha()]
-        return " ".join(clean)
-    except Exception:
-        return ""
-
-
+    return domain
 # ─────────────────────────────────────────────
 # SQLITE LOGGING
+# Every API call is logged with full detail.
+# Powers the /stats analytics endpoint.
 # ─────────────────────────────────────────────
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -153,6 +112,7 @@ def log_request(
     confidence: float = None,
     method:     str   = None,
 ):
+    """Non-crashing logger — API never fails because of a log error."""
     try:
         conn = sqlite3.connect(DB_FILE)
         conn.execute("""
@@ -164,7 +124,7 @@ def log_request(
             datetime.utcnow().isoformat(),
             ip, endpoint,
             input_url,
-            (input_text[:200] if input_text else None),
+            (input_text[:200] if input_text else None),  # cap stored text
             category, confidence,
             int(success), time_ms, method
         ))
@@ -175,55 +135,62 @@ def log_request(
 
 
 # ─────────────────────────────────────────────
-# LIFESPAN
+# LIFESPAN — startup + shutdown
 # ─────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global tokenizer, model, CLASS_NAMES, device
 
     print("=" * 60)
-    print("🚀  Website Category Classifier API  v2.1.0")
+    print("🚀  Website Category Classifier API  v2.0.0")
     print("=" * 60)
 
+    # Init SQLite
     init_db()
     print("✅ SQLite logging initialised →", DB_FILE)
 
+    # Load device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"📟 Device: {device}")
 
-    # ── Load model ──
-    # low_cpu_mem_usage=True avoids a full second copy of weights in RAM
-    # during loading — halves peak memory on CPU-only Render instances.
+    # ── Load model: HuggingFace first, local fallback ──
     try:
         print(f"🌐 Loading model from HuggingFace: {HF_MODEL_ID}")
         tokenizer = AutoTokenizer.from_pretrained(HF_MODEL_ID)
-        model = AutoModelForSequenceClassification.from_pretrained(
-            HF_MODEL_ID, low_cpu_mem_usage=True
-        )
+        model     = AutoModelForSequenceClassification.from_pretrained(HF_MODEL_ID)
         print("✅ Model loaded from HuggingFace")
-        labels_path = hf_hub_download(repo_id=HF_MODEL_ID, filename="label_classes.csv")
+
+        labels_path = hf_hub_download(
+            repo_id=HF_MODEL_ID,
+            filename="label_classes.csv"
+        )
+
     except Exception as hf_err:
         print(f"⚠️  HuggingFace load failed: {hf_err}")
         print(f"🔁 Falling back to local: {MODEL_DIR}")
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
-        model = AutoModelForSequenceClassification.from_pretrained(
-            MODEL_DIR, low_cpu_mem_usage=True
-        )
+        tokenizer   = AutoTokenizer.from_pretrained(MODEL_DIR)
+        model       = AutoModelForSequenceClassification.from_pretrained(MODEL_DIR)
         labels_path = os.path.join(MODEL_DIR, "label_classes.csv")
         print("✅ Model loaded from local folder")
 
     model.to(device)
     model.eval()
+    
+    if device.type == "cpu":
+        model = torch.quantization.quantize_dynamic(
+            model,
+            {torch.nn.Linear},
+            dtype=torch.qint8
+        )
+        print("✅ Model quantized")
 
-    # ── Load class names — csv.reader replaces pandas (saves ~30 MB) ──
+    # ── Load class names ──
     try:
-        with open(labels_path, newline="", encoding="utf-8") as f:
-            reader = csv.reader(f)
-            next(reader, None)          # skip header row if present
-            CLASS_NAMES = [
-                row[0].strip() for row in reader
-                if row and row[0].strip()
-            ]
+        labels_df   = pd.read_csv(labels_path, encoding="utf-8")
+        CLASS_NAMES = [
+            str(x).strip()
+            for x in labels_df.iloc[:, 0].dropna().tolist()
+        ]
         if not CLASS_NAMES:
             raise ValueError("label_classes.csv is empty")
         print(f"✅ Classes loaded ({len(CLASS_NAMES)}): {CLASS_NAMES}")
@@ -231,7 +198,7 @@ async def lifespan(app: FastAPI):
         print(f"❌ Class name load error: {label_err}")
         CLASS_NAMES = []
 
-    # ── Model warmup ──
+    # ── Model warmup (avoids cold-start lag on first request) ──
     try:
         dummy = tokenizer(
             "warmup input", return_tensors="pt",
@@ -244,7 +211,7 @@ async def lifespan(app: FastAPI):
         print(f"⚠️  Warmup failed: {warmup_err}")
 
     print("=" * 60)
-    print("🟢 API is ready  (LIME loads on first /explain call)")
+    print("🟢 API is ready")
     print("=" * 60)
 
     yield
@@ -256,8 +223,8 @@ async def lifespan(app: FastAPI):
 # APP INIT
 # ─────────────────────────────────────────────
 app = FastAPI(
-    title="Website Category Classifier API",
-    description=(
+    title       = "Website Category Classifier API",
+    description = (
         "Classify any website into 11 categories using DistilBERT.\n\n"
         "**Categories:** Adult · Arts · Business · Education · Gaming · "
         "Health · Kids · Lifestyle · News · Recreation · Technology\n\n"
@@ -265,16 +232,16 @@ app = FastAPI(
         "[HuggingFace](https://huggingface.co/SanandaDutta) · "
         "[GitHub](https://github.com/SanandaDutta)"
     ),
-    version="2.1.0",
-    lifespan=lifespan,
+    version  = "2.0.0",
+    lifespan = lifespan
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins     = ["*"],
+    allow_credentials = True,
+    allow_methods     = ["*"],
+    allow_headers     = ["*"],
 )
 
 app.state.limiter = limiter
@@ -282,158 +249,276 @@ app.state.limiter = limiter
 @app.exception_handler(RateLimitExceeded)
 async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
     return JSONResponse(
-        status_code=429,
-        content={
-            "error":  "Rate limit exceeded.",
-            "detail": "Max 30 requests/minute per IP on classify endpoints. "
-                      "Max 5/minute on batch and explain."
+        status_code = 429,
+        content     = {
+            "error":   "Rate limit exceeded.",
+            "detail":  "Max 30 requests/minute per IP on classify endpoints. "
+                       "Max 5/minute on batch and explain."
         }
     )
 
 
 # ─────────────────────────────────────────────
 # DOMAIN SHORTCUTS
+# Well-known Indian + global sites → instant response, no scraping needed.
 # ─────────────────────────────────────────────
 DOMAIN_SHORTCUTS = {
+    # AI / Modern Tech
+    "claude.ai": "Technology",
+    "anthropic.com": "Technology",
+    "openai.com": "Technology",
+    "chatgpt.com": "Technology",
+    "mistral.ai": "Technology",
+    "huggingface.co": "Technology",
+    "vercel.com": "Technology",
+    "supabase.com": "Technology",
+    "figma.com": "Technology",
+    "linear.app": "Technology",
+    "cloudflare.com": "Technology",
+    "digitalocean.com": "Technology",
     # ── News ──
-    "ndtv.com": "News", "thehindu.com": "News", "hindustantimes.com": "News",
-    "timesofindia.indiatimes.com": "News", "indianexpress.com": "News",
-    "scroll.in": "News", "thewire.in": "News", "theprint.in": "News",
-    "bbc.com": "News", "reuters.com": "News", "aajtak.in": "News",
-    "zeenews.india.com": "News", "news18.com": "News",
+    "ndtv.com": "News",
+    "thehindu.com": "News",
+    "hindustantimes.com": "News",
+    "timesofindia.indiatimes.com": "News",
+    "indianexpress.com": "News",
+    "scroll.in": "News",
+    "thewire.in": "News",
+    "theprint.in": "News",
+    "bbc.com": "News",
+    "reuters.com": "News",
+    "aajtak.in": "News",
+    "zeenews.india.com": "News",
+    "news18.com": "News",
     # ── Business ──
-    "moneycontrol.com": "Business", "economictimes.indiatimes.com": "Business",
-    "livemint.com": "Business", "business-standard.com": "Business",
-    "zerodha.com": "Business", "groww.in": "Business",
-    "amazon.in": "Business", "flipkart.com": "Business",
-    "razorpay.com": "Business", "paytm.com": "Business",
-    "phonepe.com": "Business", "indiamart.com": "Business", "zoho.com": "Business",
+    "moneycontrol.com": "Business",
+    "economictimes.indiatimes.com": "Business",
+    "livemint.com": "Business",
+    "business-standard.com": "Business",
+    "zerodha.com": "Business",
+    "groww.in": "Business",
+    "amazon.in": "Business",
+    "flipkart.com": "Business",
+    "razorpay.com": "Business",
+    "paytm.com": "Business",
+    "phonepe.com": "Business",
+    "indiamart.com": "Business",
+    "zoho.com": "Business",
     # ── Technology ──
-    "github.com": "Technology", "stackoverflow.com": "Technology",
-    "geeksforgeeks.org": "Technology", "hackerrank.com": "Technology",
-    "leetcode.com": "Technology", "codechef.com": "Technology",
-    "digit.in": "Technology", "gadgets360.com": "Technology",
-    "91mobiles.com": "Technology", "beebom.com": "Technology",
+    "github.com": "Technology",
+    "stackoverflow.com": "Technology",
+    "geeksforgeeks.org": "Technology",
+    "hackerrank.com": "Technology",
+    "leetcode.com": "Technology",
+    "codechef.com": "Technology",
+    "digit.in": "Technology",
+    "gadgets360.com": "Technology",
+    "91mobiles.com": "Technology",
+    "beebom.com": "Technology",
     # ── Education ──
-    "byjus.com": "Education", "unacademy.com": "Education",
-    "vedantu.com": "Education", "coursera.org": "Education",
-    "khanacademy.org": "Education", "nptel.ac.in": "Education",
-    "swayam.gov.in": "Education", "wikipedia.org": "Education",
-    "doubtnut.com": "Education", "testbook.com": "Education",
+    "byjus.com": "Education",
+    "unacademy.com": "Education",
+    "vedantu.com": "Education",
+    "coursera.org": "Education",
+    "khanacademy.org": "Education",
+    "nptel.ac.in": "Education",
+    "swayam.gov.in": "Education",
+    "wikipedia.org": "Education",
+    "doubtnut.com": "Education",
+    "testbook.com": "Education",
     # ── Health ──
-    "practo.com": "Health", "1mg.com": "Health", "netmeds.com": "Health",
-    "apollohospitals.com": "Health", "webmd.com": "Health",
-    "healthline.com": "Health", "pharmeasy.in": "Health", "cult.fit": "Health",
+    "practo.com": "Health",
+    "1mg.com": "Health",
+    "netmeds.com": "Health",
+    "apollohospitals.com": "Health",
+    "webmd.com": "Health",
+    "healthline.com": "Health",
+    "pharmeasy.in": "Health",
+    "cult.fit": "Health",
     # ── Gaming ──
-    "dream11.com": "Gaming", "mpl.live": "Gaming", "winzo.com": "Gaming",
-    "zupee.com": "Gaming", "rummycircle.com": "Gaming", "adda52.com": "Gaming",
+    "dream11.com": "Gaming",
+    "mpl.live": "Gaming",
+    "winzo.com": "Gaming",
+    "zupee.com": "Gaming",
+    "rummycircle.com": "Gaming",
+    "adda52.com": "Gaming",
     # ── Recreation ──
-    "cricbuzz.com": "Recreation", "espncricinfo.com": "Recreation",
-    "sportskeeda.com": "Recreation", "indiahikes.com": "Recreation",
-    "bcci.tv": "Recreation", "iplt20.com": "Recreation",
+    "cricbuzz.com": "Recreation",
+    "espncricinfo.com": "Recreation",
+    "sportskeeda.com": "Recreation",
+    "indiahikes.com": "Recreation",
+    "bcci.tv": "Recreation",
+    "iplt20.com": "Recreation",
     # ── Lifestyle ──
-    "zomato.com": "Lifestyle", "swiggy.com": "Lifestyle",
-    "makemytrip.com": "Lifestyle", "nykaa.com": "Lifestyle",
-    "vogue.in": "Lifestyle", "femina.in": "Lifestyle",
-    "mensxp.com": "Lifestyle", "shaadi.com": "Lifestyle",
+    "zomato.com": "Lifestyle",
+    "swiggy.com": "Lifestyle",
+    "makemytrip.com": "Lifestyle",
+    "nykaa.com": "Lifestyle",
+    "vogue.in": "Lifestyle",
+    "femina.in": "Lifestyle",
+    "mensxp.com": "Lifestyle",
+    "shaadi.com": "Lifestyle",
     # ── Kids ──
-    "firstcry.com": "Kids", "nickelodeonindia.com": "Kids",
-    "tinkle.in": "Kids", "amarchitrakatha.com": "Kids",
-    "disneyindia.in": "Kids", "chuChutv.com": "Kids",
+    "firstcry.com": "Kids",
+    "nickelodeonindia.com": "Kids",
+    "tinkle.in": "Kids",
+    "amarchitrakatha.com": "Kids",
+    "disneyindia.in": "Kids",
+    "chuChutv.com": "Kids",
     # ── Arts ──
-    "gaana.com": "Arts", "saavn.com": "Arts", "filmfare.com": "Arts",
-    "bollywoodhungama.com": "Arts", "pratilipi.com": "Arts",
-    "rekhta.org": "Arts", "bookmyshow.com": "Arts",
+    "gaana.com": "Arts",
+    "saavn.com": "Arts",
+    "filmfare.com": "Arts",
+    "bollywoodhungama.com": "Arts",
+    "pratilipi.com": "Arts",
+    "rekhta.org": "Arts",
+    "bookmyshow.com": "Arts",
     # ── Video / Streaming ──
-    "youtube.com": "Arts", "youtu.be": "Arts", "netflix.com": "Arts",
-    "primevideo.com": "Arts", "hotstar.com": "Arts",
-    "disneyplus.com": "Arts", "zee5.com": "Arts",
-    "sonyliv.com": "Arts", "voot.com": "Arts",
-    "twitch.tv": "Gaming",
+    "youtube.com":       "Arts",
+    "youtu.be":          "Arts",
+    "netflix.com":       "Arts",
+    "primevideo.com":    "Arts",
+    "hotstar.com":       "Arts",
+    "disneyplus.com":    "Arts",
+    "zee5.com":          "Arts",
+    "sonyliv.com":       "Arts",
+    "voot.com":          "Arts",
+    "twitch.tv":         "Gaming",
+    
     # ── Social ──
-    "instagram.com": "Lifestyle", "twitter.com": "News",
-    "x.com": "News", "facebook.com": "News",
-    "linkedin.com": "Business", "reddit.com": "News",
+    "instagram.com":     "Lifestyle",
+    "twitter.com":       "News",
+    "x.com":             "News",
+    "facebook.com":      "News",
+    "linkedin.com":      "Business",
+    "reddit.com":        "News",
+    
     # ── E-commerce ──
-    "amazon.com": "Business", "ebay.com": "Business",
-    "meesho.com": "Business", "myntra.com": "Business", "ajio.com": "Business",
+    "amazon.com":        "Business",
+    "amazon.in":         "Business",
+    "ebay.com":          "Business",
+    "meesho.com":        "Business",
+    "myntra.com":        "Business",
+    "ajio.com":          "Business",
 }
 
 
 # ─────────────────────────────────────────────
-# MODEL PREDICTION
-#
-# lru_cache size reduced to 50 (was 100).
-# Feature strings are capped at MAX_FEATURE_CHARS before being passed in,
-# so each cached slot is much smaller (~1 KB vs ~10 KB).
+# HELPERS
 # ─────────────────────────────────────────────
-@lru_cache(maxsize=50)
+def get_ip(request: Request) -> str:
+    """Extract real IP even behind Render's proxy."""
+    forwarded = request.headers.get("x-forwarded-for")
+    return forwarded.split(",")[0].strip() if forwarded else (
+        request.client.host if request.client else "unknown"
+    )
+
+def get_domain(url: str) -> str:
+    parsed = urlparse(url if url.startswith("http") else "https://" + url)
+    return parsed.netloc.replace("www.", "").lower()
+
+def is_valid_url(url: str) -> bool:
+    pattern = re.compile(
+        r'^(https?://)?'
+        r'(([a-zA-Z0-9\-]+\.)+[a-zA-Z]{2,})'
+        r'(/.*)?$'
+    )
+    return bool(re.match(pattern, url))
+
+def extract_url_features(url: str) -> str:
+    """
+    Converts URL into token string matching prepare_data.py logic.
+    Same feature engineering used during training.
+    """
+    try:
+        parsed       = urlparse(url if url.startswith("http") else "http://" + url)
+        domain       = parsed.netloc.replace("www.", "")
+        path         = parsed.path
+        tld          = domain.split(".")[-1] if "." in domain else ""
+        domain_words = re.split(r'[.\-_]', domain)
+        path_words   = re.split(r'[/\-_.]', path)
+
+        tld_signal = {
+            "edu": "education university college academic",
+            "gov": "government official public authority",
+            "org": "organization nonprofit charity",
+            "ac":  "academic university college",
+            "mil": "military government defense",
+        }.get(tld, "")
+
+        all_parts = domain_words * 3 + path_words + tld_signal.split()
+        clean     = [w.lower() for w in all_parts if len(w) > 2 and w.isalpha()]
+        return " ".join(clean)
+    except Exception:
+        return ""
+
+
+# ─────────────────────────────────────────────
+# MODEL PREDICTION
+# LRU cache: repeated identical inputs skip inference entirely.
+# ─────────────────────────────────────────────
+@lru_cache(maxsize=1000)
 def run_prediction(feature_string: str):
     """
-    DistilBERT inference. Returns (category, confidence_%, top3_list).
-    Input is already capped to MAX_FEATURE_CHARS by callers.
+    DistilBERT inference with softmax probabilities.
+    Returns (category, confidence_%, top3_list)
+    Cached for 1000 unique inputs — speeds up repeated URLs.
     """
+
     enc = tokenizer(
         feature_string,
         truncation=True,
-        max_length=512,
+        max_length=256,
         padding=True,
-        return_tensors="pt",
+        return_tensors="pt"
     )
+
+    # Move tensors to device
     enc = {k: v.to(device) for k, v in enc.items()}
-    enc.pop("token_type_ids", None)   # DistilBERT has no token_type_ids
+
+    # DistilBERT does NOT use token_type_ids
+    enc.pop("token_type_ids", None)
 
     with torch.no_grad():
         logits = model(**enc).logits
 
-    # Use torch for softmax; numpy only for argsort/argmax on a tiny vector
-    probs    = torch.softmax(logits, dim=-1)[0].cpu().numpy()
+    probs = torch.softmax(logits, dim=-1)[0].cpu().numpy()
+
     top3_idx = np.argsort(probs)[::-1][:3]
+
     top3 = [
-        {"category": CLASS_NAMES[i], "confidence": round(float(probs[i] * 100), 2)}
+        {
+            "category": CLASS_NAMES[i],
+            "confidence": round(float(probs[i] * 100), 2)
+        }
         for i in top3_idx
     ]
-    pred_idx   = int(np.argmax(probs))
-    category   = CLASS_NAMES[pred_idx]
+
+    pred_idx = int(np.argmax(probs))
+
+    category = CLASS_NAMES[pred_idx]
+
     confidence = round(float(probs[pred_idx] * 100), 2)
+
     return category, confidence, top3
 
 
-def _predict_proba_batch_fn(texts: List[str]) -> np.ndarray:
+def predict_proba_batch(texts: List[str]) -> np.ndarray:
     """
-    Batched softmax used internally by LIME.
-    Defined as a plain function (not cached) because LIME sends unique
-    perturbed variants on every call. Only referenced inside /explain.
+    Batched softmax — used internally by LIME explainer.
+    Not cached (LIME generates perturbed variants each time).
     """
     all_probs = []
     for i in range(0, len(texts), 16):
-        batch = texts[i: i + 16]
-        enc = tokenizer(
+        batch = texts[i : i + 16]
+        enc   = tokenizer(
             batch, truncation=True, max_length=512,
-            padding=True, return_tensors="pt",
+            padding=True, return_tensors="pt"
         ).to(device)
-        enc.pop("token_type_ids", None)
         with torch.no_grad():
             logits = model(**enc).logits
         all_probs.append(torch.softmax(logits, dim=-1).cpu().numpy())
     return np.vstack(all_probs)
-
-
-# ─────────────────────────────────────────────
-# SHARED FEATURE BUILDER  (used by every endpoint)
-# ─────────────────────────────────────────────
-def build_features(url: str, scraped: dict) -> tuple[str, str]:
-    """
-    Returns (feature_string_capped, method_label).
-    Caps output at MAX_FEATURE_CHARS so cache slots stay small.
-    """
-    if scraped.get("error"):
-        raw    = extract_url_features(url)
-        method = "url_features_only"
-    else:
-        raw    = (build_feature_string(scraped) + " " + extract_url_features(url)).strip()
-        method = "combined_features"
-    return raw[:MAX_FEATURE_CHARS], method
 
 
 # ─────────────────────────────────────────────
@@ -465,7 +550,7 @@ class PredictionResult(BaseModel):
 def home():
     return {
         "message" : "Website Category Classifier API 🚀",
-        "version" : "2.1.0",
+        "version" : "2.0.0",
         "model"   : "DistilBERT fine-tuned",
         "classes" : CLASS_NAMES,
         "docs"    : "/docs",
@@ -474,11 +559,10 @@ def home():
             "POST /classify/text   — predict from raw text",
             "POST /classify/batch  — up to 20 URLs + CSV export",
             "POST /safe-check      — Adult/Kids safety flag + verdict",
-            "GET  /explain?url=    — LIME XAI word explanation (lazy-loaded)",
+            "GET  /explain?url=    — LIME XAI word explanation",
             "GET  /stats           — API usage analytics",
             "GET  /stats/export    — download logs as CSV",
             "GET  /health          — model status",
-            "GET  /ping            — keepalive",
         ]
     }
 
@@ -497,31 +581,28 @@ def health():
     }
 
 
-# ── Ping / keepalive ──────────────────────────
-@app.get("/ping", tags=["Info"])
-def ping():
-    return {"status": "alive"}
-
-
 # ── 1. POST /classify/url ─────────────────────
 @app.post("/classify/url", response_model=PredictionResult, tags=["Classify"])
 @limiter.limit("30/minute")
 async def classify_url(request: Request, body: URLRequest):
     """
     Classify a website by its URL.
-    Known domains → instant shortcut response.
-    Unknown domains → scrape + DistilBERT.
+    - Known domains → instant response via shortcut table
+    - Unknown domains → scrape page content + extract URL features → DistilBERT
+    - Scrape fails → URL features only (still works, just less accurate)
     """
     start = time.time()
     ip    = get_ip(request)
 
     try:
         url = body.url.strip()
+
         if not is_valid_url(url):
             raise HTTPException(422, "Invalid URL format.")
 
         domain = get_domain(url)
 
+        # ── Fast path: known domain ──
         if domain in DOMAIN_SHORTCUTS:
             category = DOMAIN_SHORTCUTS[domain]
             elapsed  = round((time.time() - start) * 1000, 1)
@@ -531,26 +612,36 @@ async def classify_url(request: Request, body: URLRequest):
             return PredictionResult(
                 category=category, confidence=99.0,
                 top3=[{"category": category, "confidence": 99.0}],
-                method="domain_shortcut", time_ms=elapsed,
+                method="domain_shortcut", time_ms=elapsed
             )
 
+        # ── Scrape + feature extraction ──
         try:
             scraped = scrape_website(url)
         except Exception:
             scraped = {"error": "SCRAPE_FAILED"}
 
-        features, method = build_features(url, scraped)
+        if scraped.get("error"):
+            features = extract_url_features(url)
+            method   = "url_features_only"
+        else:
+            content  = build_feature_string(scraped)
+            features = (content + " " + extract_url_features(url)).strip()
+            method   = "combined_features"
+
         if not features.strip():
             raise HTTPException(422, "Could not extract any features from this URL.")
 
         category, confidence, top3 = run_prediction(features)
         elapsed = round((time.time() - start) * 1000, 1)
+
         log_request(ip, "/classify/url", True, elapsed,
                     input_url=url, category=category,
                     confidence=confidence, method=method)
+
         return PredictionResult(
             category=category, confidence=confidence,
-            top3=top3, method=method, time_ms=elapsed,
+            top3=top3, method=method, time_ms=elapsed
         )
 
     except HTTPException:
@@ -565,25 +656,31 @@ async def classify_url(request: Request, body: URLRequest):
 @limiter.limit("30/minute")
 async def classify_text(request: Request, body: TextRequest):
     """
-    Classify raw text. Min 10 chars; trimmed to MAX_FEATURE_CHARS.
+    Classify raw text — page title, meta description, scraped content, keywords.
+    Min 10 chars. Text over 5000 chars is trimmed to first 5000.
     """
     start = time.time()
     ip    = get_ip(request)
 
     try:
         text = body.text.strip()
+
         if len(text) < 10:
             raise HTTPException(422, "Text too short. Minimum 10 characters.")
-        text = text[:MAX_FEATURE_CHARS]   # consistent cap with URL endpoints
+
+        if len(text) > 5000:
+            text = text[:5000]
 
         category, confidence, top3 = run_prediction(text)
         elapsed = round((time.time() - start) * 1000, 1)
+
         log_request(ip, "/classify/text", True, elapsed,
                     input_text=text, category=category,
                     confidence=confidence, method="text_input")
+
         return PredictionResult(
             category=category, confidence=confidence,
-            top3=top3, method="text_input", time_ms=elapsed,
+            top3=top3, method="text_input", time_ms=elapsed
         )
 
     except HTTPException:
@@ -598,7 +695,9 @@ async def classify_text(request: Request, body: TextRequest):
 @limiter.limit("5/minute")
 async def classify_batch(request: Request, body: BatchURLRequest):
     """
-    Classify up to 20 URLs. Returns JSON + CSV export string.
+    Classify up to 20 URLs in one request.
+    Returns JSON results + a CSV string ready for Excel export.
+    Use case: brand safety audits, ad network screening, bulk analysis.
     """
     start = time.time()
     ip    = get_ip(request)
@@ -616,12 +715,13 @@ async def classify_batch(request: Request, body: BatchURLRequest):
                 domain = get_domain(url)
 
                 if domain in DOMAIN_SHORTCUTS:
-                    cat = DOMAIN_SHORTCUTS[domain]
                     results.append({
-                        "url": url, "category": cat, "confidence": 99.0,
-                        "method": "domain_shortcut",
-                        "safe": cat not in ADULT_CATEGORIES,
-                        "adult_flag": cat in ADULT_CATEGORIES,
+                        "url"       : url,
+                        "category"  : DOMAIN_SHORTCUTS[domain],
+                        "confidence": 99.0,
+                        "method"    : "domain_shortcut",
+                        "safe"      : DOMAIN_SHORTCUTS[domain] not in ADULT_CATEGORIES,
+                        "adult_flag": DOMAIN_SHORTCUTS[domain] in ADULT_CATEGORIES,
                     })
                     continue
 
@@ -630,34 +730,45 @@ async def classify_batch(request: Request, body: BatchURLRequest):
                 except Exception:
                     scraped = {"error": "SCRAPE_FAILED"}
 
-                features, _ = build_features(url, scraped)
+                features = (
+                    build_feature_string(scraped) + " " + extract_url_features(url)
+                ).strip() if not scraped.get("error") else extract_url_features(url)
 
                 if features.strip():
                     category, confidence, _ = run_prediction(features)
                     results.append({
-                        "url": url, "category": category,
-                        "confidence": confidence, "method": "ml_model",
-                        "safe": category not in ADULT_CATEGORIES,
+                        "url"       : url,
+                        "category"  : category,
+                        "confidence": confidence,
+                        "method"    : "ml_model",
+                        "safe"      : category not in ADULT_CATEGORIES,
                         "adult_flag": category in ADULT_CATEGORIES,
                     })
                 else:
                     results.append({
-                        "url": url, "category": "Unknown",
-                        "confidence": 0.0, "method": "no_features",
-                        "safe": None, "adult_flag": None,
+                        "url"       : url,
+                        "category"  : "Unknown",
+                        "confidence": 0.0,
+                        "method"    : "no_features",
+                        "safe"      : None,
+                        "adult_flag": None,
                     })
 
             except Exception as inner_e:
                 results.append({
-                    "url": url, "category": "Error",
-                    "confidence": 0.0, "method": str(inner_e)[:80],
-                    "safe": None, "adult_flag": None,
+                    "url"       : url,
+                    "category"  : "Error",
+                    "confidence": 0.0,
+                    "method"    : str(inner_e)[:80],
+                    "safe"      : None,
+                    "adult_flag": None,
                 })
 
         elapsed = round((time.time() - start) * 1000, 1)
         log_request(ip, "/classify/batch", True, elapsed,
                     method=f"batch_{len(results)}_urls")
 
+        # CSV string for direct Excel paste / download
         csv_lines = ["url,category,confidence,method,safe,adult_flag"]
         for r in results:
             csv_lines.append(
@@ -666,10 +777,10 @@ async def classify_batch(request: Request, body: BatchURLRequest):
             )
 
         return {
-            "total"     : len(results),
-            "time_ms"   : elapsed,
-            "results"   : results,
-            "csv_export": "\n".join(csv_lines),
+            "total"      : len(results),
+            "time_ms"    : elapsed,
+            "results"    : results,
+            "csv_export" : "\n".join(csv_lines),
         }
 
     except HTTPException:
@@ -684,18 +795,29 @@ async def classify_batch(request: Request, body: BatchURLRequest):
 @limiter.limit("30/minute")
 async def safe_check(request: Request, body: URLRequest):
     """
-    Safety classification: parental controls, ad brand safety, firewall filtering.
+    Safety classification for:
+    - Parental controls
+    - Ad network brand safety
+    - Firewall URL filtering
+
+    Returns:
+      safe          → True = general audience safe
+      adult_flag    → True = Adult content detected (block recommended)
+      kids_safe     → True = explicitly Kids category
+      safe_for_kids → True = Education / Kids / Arts / Recreation
+      verdict       → human-readable string with emoji
     """
     start = time.time()
     ip    = get_ip(request)
 
     try:
-        url = body.url.strip()
+        url    = body.url.strip()
+
         if not is_valid_url(url):
             raise HTTPException(422, "Invalid URL format.")
 
+        domain = get_domain(url)
         domain = normalize_domain(url)
-
         if domain in DOMAIN_SHORTCUTS:
             category   = DOMAIN_SHORTCUTS[domain]
             confidence = 99.0
@@ -706,10 +828,15 @@ async def safe_check(request: Request, body: URLRequest):
             except Exception:
                 scraped = {"error": "SCRAPE_FAILED"}
 
-            features, method = build_features(url, scraped)
+            features = (
+                build_feature_string(scraped) + " " + extract_url_features(url)
+            ).strip() if not scraped.get("error") else extract_url_features(url)
+
             if not features.strip():
                 raise HTTPException(422, "Could not extract features from URL.")
+
             category, confidence, _ = run_prediction(features)
+            method = "ml_model"
 
         adult_flag    = category in ADULT_CATEGORIES
         kids_safe     = category == KIDS_CATEGORY
@@ -717,9 +844,9 @@ async def safe_check(request: Request, body: URLRequest):
         safe          = not adult_flag
 
         verdict = (
-            "🔴 ADULT — block recommended" if adult_flag    else
-            "🟢 KIDS SAFE"                 if kids_safe     else
-            "🟡 SAFE FOR KIDS"             if safe_for_kids else
+            "🔴 ADULT — block recommended"  if adult_flag    else
+            "🟢 KIDS SAFE"                  if kids_safe     else
+            "🟡 SAFE FOR KIDS"              if safe_for_kids else
             "🟢 SAFE"
         )
 
@@ -729,10 +856,16 @@ async def safe_check(request: Request, body: URLRequest):
                     confidence=confidence, method=method)
 
         return {
-            "url": url, "category": category, "confidence": confidence,
-            "safe": safe, "adult_flag": adult_flag,
-            "kids_safe": kids_safe, "safe_for_kids": safe_for_kids,
-            "verdict": verdict, "method": method, "time_ms": elapsed,
+            "url"          : url,
+            "category"     : category,
+            "confidence"   : confidence,
+            "safe"         : safe,
+            "adult_flag"   : adult_flag,
+            "kids_safe"    : kids_safe,
+            "safe_for_kids": safe_for_kids,
+            "verdict"      : verdict,
+            "method"       : method,
+            "time_ms"      : elapsed,
         }
 
     except HTTPException:
@@ -742,35 +875,28 @@ async def safe_check(request: Request, body: URLRequest):
         raise HTTPException(500, f"Internal error: {str(e)}")
 
 
-# ── 5. GET /explain  (LIME — lazy import) ─────
+# ── 5. GET /explain  (LIME XAI) ───────────────
 @app.get("/explain", tags=["XAI"])
 @limiter.limit("5/minute")
 async def explain(
     request: Request,
     url    : str = Query(..., description="Full URL to explain"),
-    n_words: int = Query(10,  description="Number of top words (max 20)"),
+    n_words: int = Query(10,  description="Number of top words (max 20)")
 ):
     """
     Explains which words drove the DistilBERT prediction for a URL.
     Uses LIME (Local Interpretable Model-agnostic Explanations).
 
-    LIME is imported lazily here — it is NOT loaded at server startup,
-    saving ~50–80 MB of RAM when this endpoint is not in use.
+    Slower than other endpoints (~10–20s per call).
+    Rate limited to 5/minute to protect server resources.
 
-    Slower than other endpoints (~10–20 s per call).
-    Rate-limited to 5/minute.
+    Supports the GET /explain endpoint shown in your roadmap (XAI column).
     """
     start = time.time()
     ip    = get_ip(request)
 
     try:
-        # ── Lazy LIME import ──────────────────────────────────────────────
-        # This is the key memory saving: lime + its dependencies (scikit-learn,
-        # scipy, etc.) are loaded into the process only when /explain is
-        # actually called for the first time.  Python caches the module after
-        # that, so subsequent calls pay no extra import overhead.
-        from lime.lime_text import LimeTextExplainer   # noqa: PLC0415
-        # ─────────────────────────────────────────────────────────────────
+        from lime.lime_text import LimeTextExplainer
 
         n_words = min(max(n_words, 1), 20)
 
@@ -779,37 +905,27 @@ async def explain(
         except Exception:
             scraped = {"error": "SCRAPE_FAILED"}
 
-        features, _ = build_features(url, scraped)
-        # LIME works better with a bit more text, so use 2 500 chars here
-        # (we still don't cache this call, so the larger string is fine).
-        if not scraped.get("error"):
-            raw_long = (build_feature_string(scraped) + " " + extract_url_features(url)).strip()
-            features_for_lime = raw_long[:2_500]
-        else:
-            features_for_lime = extract_url_features(url)[:2_500]
+        features = (
+            build_feature_string(scraped) + " " + extract_url_features(url)
+        ).strip() if not scraped.get("error") else extract_url_features(url)
 
-        if not features_for_lime.strip():
+        if not features.strip():
             raise HTTPException(422, "Could not extract features from URL.")
 
-        # Use the capped string for the main prediction (cache hit likely)
-        category, confidence, top3 = run_prediction(features_for_lime[:MAX_FEATURE_CHARS])
+        category, confidence, top3 = run_prediction(features)
         pred_idx = CLASS_NAMES.index(category)
 
         explainer = LimeTextExplainer(
-            class_names=CLASS_NAMES,
-            bow=False,
-            random_state=42,
+            class_names  = CLASS_NAMES,
+            bow          = False,
+            random_state = 42
         )
-        exp = await asyncio.wait_for(
-            asyncio.to_thread(
-                explainer.explain_instance,
-                features_for_lime,
-                _predict_proba_batch_fn,
-                labels=[pred_idx],
-                num_features=n_words,
-                num_samples=100,
-            ),
-            timeout=25,
+        exp = explainer.explain_instance(
+            features,
+            predict_proba_batch,
+            labels      = [pred_idx],
+            num_features= n_words,
+            num_samples = 200     # keep low for API speed; raise for accuracy
         )
 
         word_weights = [
@@ -833,7 +949,7 @@ async def explain(
             "top3"       : top3,
             "explanation": word_weights,
             "note"       : (
-                f"Words with direction='supports' pushed the prediction toward "
+                "Words with direction='supports' pushed the prediction toward "
                 f"'{category}'. Words with 'opposes' pushed against it."
             ),
             "time_ms"    : elapsed,
@@ -846,13 +962,16 @@ async def explain(
         raise HTTPException(500, f"Explain error: {str(e)}")
 
 
-# ── 6. GET /stats ─────────────────────────────
+# ── 6. GET /stats  (Analytics dashboard) ──────
 @app.get("/stats", tags=["Analytics"])
 async def get_stats(
     request: Request,
-    limit  : int = Query(100, le=1000, description="Max recent requests to return"),
+    limit  : int = Query(100, le=1000, description="Max recent requests to return")
 ):
-    """API usage analytics."""
+    """
+    API usage analytics — powers the Analytics Dashboard in your roadmap.
+    Shows: total calls, success rate, category breakdown, per-endpoint stats.
+    """
     try:
         conn = sqlite3.connect(DB_FILE)
 
@@ -879,15 +998,13 @@ async def get_stats(
             ORDER BY count DESC
         """).fetchall()
 
-        recent = conn.execute(
-            f"""
+        recent = conn.execute(f"""
             SELECT timestamp, ip, endpoint, input_url,
                    category, confidence, success, time_ms, method
             FROM api_logs
             ORDER BY id DESC
             LIMIT {limit}
-            """
-        ).fetchall()
+        """).fetchall()
 
         conn.close()
 
@@ -899,7 +1016,10 @@ async def get_stats(
                 "success_rate"  : round(success_count / total * 100, 1) if total else 0,
             },
             "by_endpoint": [
-                {"endpoint": r[0], "calls": r[1], "avg_ms": r[2], "errors": r[3]}
+                {
+                    "endpoint": r[0], "calls": r[1],
+                    "avg_ms": r[2], "errors": r[3]
+                }
                 for r in by_endpoint
             ],
             "by_category": [
@@ -908,9 +1028,11 @@ async def get_stats(
             ],
             "recent_requests": [
                 {
-                    "timestamp": r[0], "ip": r[1], "endpoint": r[2],
-                    "input_url": r[3], "category": r[4], "confidence": r[5],
-                    "success": bool(r[6]), "time_ms": r[7], "method": r[8],
+                    "timestamp" : r[0], "ip"        : r[1],
+                    "endpoint"  : r[2], "input_url" : r[3],
+                    "category"  : r[4], "confidence": r[5],
+                    "success"   : bool(r[6]), "time_ms": r[7],
+                    "method"    : r[8],
                 }
                 for r in recent
             ],
@@ -920,10 +1042,13 @@ async def get_stats(
         raise HTTPException(500, f"Stats error: {str(e)}")
 
 
-# ── 7. GET /stats/export ──────────────────────
+# ── 7. GET /stats/export  (CSV download) ──────
 @app.get("/stats/export", tags=["Analytics"])
 async def export_logs():
-    """Download all API logs as a CSV file."""
+    """
+    Download all API logs as a CSV file.
+    Useful for the Analytics Dashboard PDF export feature in your roadmap.
+    """
     try:
         conn = sqlite3.connect(DB_FILE)
         rows = conn.execute("""
@@ -943,9 +1068,35 @@ async def export_logs():
 
         return StreamingResponse(
             iter(["\n".join(lines)]),
-            media_type="text/csv",
-            headers={"Content-Disposition": "attachment; filename=api_logs.csv"},
+            media_type = "text/csv",
+            headers    = {
+                "Content-Disposition": "attachment; filename=api_logs.csv"
+            }
         )
 
     except Exception as e:
         raise HTTPException(500, f"Export error: {str(e)}")
+
+# ============================================================
+# HEALTH / KEEPALIVE ROUTES
+# ============================================================
+
+@app.get("/")
+def root():
+    return {
+        "message": "Website Category Classifier API is live"
+    }
+
+
+@app.get("/ping")
+def ping():
+    return {
+        "status": "alive"
+    }
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok"
+    }
