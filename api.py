@@ -85,49 +85,62 @@ _hf_client: httpx.AsyncClient = None
 # ─────────────────────────────────────────────
 # LIFESPAN
 # ─────────────────────────────────────────────
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _hf_client
 
     print("=" * 55)
-    print("Website Category Classifier API  v2.5.0")
+    print("Website Category Classifier API   v2.5.0")
     print("=" * 55)
 
+    # 1. Initialize Database
     init_db()
     print("SQLite ready")
 
+    # 2. Validate Credentials
     if not HF_TOKEN:
         print("WARNING: HF_TOKEN not set — inference calls will fail.")
         print("Set HF_TOKEN in Render environment variables.")
     else:
         print(f"HF Inference API ready → {HF_API_URL}")
 
-    # Create persistent async HTTP client
+    # 3. Create persistent async HTTP client
     _hf_client = httpx.AsyncClient(
         timeout=httpx.Timeout(connect=25.0, read=25.0, write=10.0, pool=5.0),
         headers={"Authorization": f"Bearer {HF_TOKEN}"},
         limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
     )
 
-    # Pre-warm HF model: send one dummy request so the model is loaded
-    # on HF's side before the first real user request arrives.
-    # This avoids the 8-20s cold start on the first real call.
-    print("Pre-warming HF model (sends one dummy request)...")
-    try:
-        await _call_hf_inference("technology software website startup")
-        print("HF model warm ✓")
-    except Exception as e:
-        print(f"Pre-warm skipped (model may be cold on first request): {e}")
+    # 4. Professional Fix: Network Stability & Retry Loop
+    print("Waiting 5s for Render network stability...")
+    await asyncio.sleep(5) 
+
+    print("Pre-warming HF model (sending dummy request)...")
+    for i in range(3):
+        try:
+            # We use a standard string to check if the model is awake
+            await _call_hf_inference("technology software website startup")
+            print("HF model warm ✓")
+            break
+        except Exception as e:
+            if i < 2:
+                print(f"Pre-warm attempt {i+1} failed, retrying in 5s... ({e})")
+                await asyncio.sleep(5)
+            else:
+                print(f"Pre-warm skipped after 3 attempts: {e}")
+                print("Note: First user request may experience a cold-start delay.")
 
     print("API ready — RAM ~80 MB on this instance")
     print("=" * 55)
 
-    yield
+    # --- API IS NOW LIVE ---
+    yield 
+    # -----------------------
 
+    # 5. Cleanup on shutdown
     await _hf_client.aclose()
     print("HTTP client closed. Shutting down.")
-
-
 # ─────────────────────────────────────────────
 # HF INFERENCE API CALLER
 # ─────────────────────────────────────────────
