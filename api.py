@@ -86,61 +86,94 @@ _hf_client: httpx.AsyncClient = None
 # LIFESPAN
 # ─────────────────────────────────────────────
 
+# --- 1. THE BACKGROUND ENGINE ---
+async def background_prewarm():
+    """
+    This function runs quietly after the API is live.
+    It solves the 'No address associated with hostname' error by waiting 
+    for Render's network to fully connect.
+    """
+    # Wait 15 seconds to ensure Render's DNS is fully active
+    await asyncio.sleep(15) 
+    
+    print("\n" + "═"*30)
+    print("🚀 BACKGROUND PRE-WARM STARTING")
+    print("═"*30)
+    
+    for i in range(3):
+        try:
+            # Send dummy data to wake up the Hugging Face Model
+            await _call_hf_inference("warmup") 
+            print(f"✅ HF model is awake and ready! (Attempt {i+1})")
+            print("═"*30 + "\n")
+            return
+        except Exception as e:
+            # If HF is still loading (503), wait and try again
+            print(f"⚠️ Pre-warm attempt {i+1} failed: {e}")
+            if i < 2:
+                print("🔄 Retrying in 10 seconds...")
+                await asyncio.sleep(10)
+    
+    print("❌ Background pre-warm failed after 3 attempts.")
+    print("💡 Note: The first user request will trigger the model wake-up.")
+    print("═"*30 + "\n")
+
+
+# --- 2. THE MAIN LIFESPAN GATEWAY ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """
+    The heart of the API. This handles everything from database 
+    initialization to the final shutdown cleanup.
+    """
     global _hf_client
 
-    print("=" * 55)
-    print("Website Category Classifier API   v2.5.0")
-    print("=" * 55)
+    print("\n" + "╔" + "═"*53 + "╗")
+    print(f"║ {'WEBSITE CATEGORY CLASSIFIER v2.5.0':^51} ║")
+    print("╚" + "═"*53 + "╝")
 
-    # 1. Initialize Database
-    init_db()
-    print("SQLite ready")
+    # PHASE A: Database Initialization
+    try:
+        init_db()
+        print("📁 [1/4] SQLite Database: Ready")
+    except Exception as e:
+        print(f"❌ [1/4] SQLite Database: FAILED ({e})")
 
-    # 2. Validate Credentials
+    # PHASE B: Credentials & Environment Validation
     if not HF_TOKEN:
-        print("WARNING: HF_TOKEN not set — inference calls will fail.")
-        print("Set HF_TOKEN in Render environment variables.")
+        print("🚫 [2/4] Credentials: HF_TOKEN MISSING (API will fail)")
     else:
-        print(f"HF Inference API ready → {HF_API_URL}")
+        print(f"🔑 [2/4] Credentials: HF_TOKEN Verified")
+        print(f"🤖 [2/4] Model Target: {HF_MODEL_ID}")
 
-    # 3. Create persistent async HTTP client
+    # PHASE C: Establish Persistent Network Connection
+    # We create the client here so it's ready before the yield
     _hf_client = httpx.AsyncClient(
         timeout=httpx.Timeout(connect=25.0, read=25.0, write=10.0, pool=5.0),
         headers={"Authorization": f"Bearer {HF_TOKEN}"},
         limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
     )
+    print("🌐 [3/4] Network: HTTPX Client Initialized")
 
-    # 4. Professional Fix: Network Stability & Retry Loop
-    print("Waiting 5s for Render network stability...")
-    await asyncio.sleep(5) 
+    # PHASE D: Trigger the Background Pre-Warm
+    # CRITICAL: No 'await' here. This lets the function run in the 
+    # background while we move on to 'yield' (making the API live).
+    asyncio.create_task(background_prewarm())
+    print("🛰️ [4/4] AI Engine: Background pre-warm scheduled")
 
-    print("Pre-warming HF model (sending dummy request)...")
-    for i in range(3):
-        try:
-            # We use a standard string to check if the model is awake
-            await _call_hf_inference("technology software website startup")
-            print("HF model warm ✓")
-            break
-        except Exception as e:
-            if i < 2:
-                print(f"Pre-warm attempt {i+1} failed, retrying in 5s... ({e})")
-                await asyncio.sleep(5)
-            else:
-                print(f"Pre-warm skipped after 3 attempts: {e}")
-                print("Note: First user request may experience a cold-start delay.")
+    print("\n🚀 STATUS: API IS LIVE | RAM: ~80MB")
+    print("═"*55 + "\n")
 
-    print("API ready — RAM ~80 MB on this instance")
-    print("=" * 55)
-
-    # --- API IS NOW LIVE ---
+    # --- API EXECUTION PAUSE ---
     yield 
-    # -----------------------
+    # ---------------------------
 
-    # 5. Cleanup on shutdown
+    # PHASE E: Graceful Shutdown
+    # This runs when you stop the server or Render redeploys
     await _hf_client.aclose()
-    print("HTTP client closed. Shutting down.")
+    print("\n" + "═"*55)
+    print("🛑 SHUTDOWN: HTTPX Client Closed. Service Offline.")
+    print("═"*55)
 # ─────────────────────────────────────────────
 # HF INFERENCE API CALLER
 # ─────────────────────────────────────────────
