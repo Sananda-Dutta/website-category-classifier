@@ -364,14 +364,16 @@ app = FastAPI(
 )
 
 # ── RapidAPI proxy secret ─────────────────────
-RAPIDAPI_SECRET = os.getenv("RAPIDAPI_PROXY_SECRET", "")
+RAPIDAPI_SECRET = os.getenv("RAPIDAPI_PROXY_SECRET", "").strip()
 
 @app.middleware("http")
 async def verify_rapidapi_proxy(request: Request, call_next):
     skip_paths = {"/health", "/docs", "/openapi.json", "/redoc",
                   "/", "/ping", "/usage"}
     if RAPIDAPI_SECRET and request.url.path not in skip_paths:
-        if request.headers.get("X-RapidAPI-Proxy-Secret", "") != RAPIDAPI_SECRET:
+        incoming = request.headers.get("X-RapidAPI-Proxy-Secret", "").strip()
+        print(f"[AUTH] path={request.url.path} incoming={repr(incoming)} expected={repr(RAPIDAPI_SECRET)} match={incoming == RAPIDAPI_SECRET}")
+        if incoming != RAPIDAPI_SECRET:
             return JSONResponse(status_code=403, content={
                 "error": "Access via RapidAPI only. Sign up at rapidapi.com"
             })
