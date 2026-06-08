@@ -95,7 +95,7 @@ async def background_prewarm():
     for Render's network to fully connect.
     """
     # Wait 15 seconds to ensure Render's DNS is fully active
-    await asyncio.sleep(15) 
+    await asyncio.sleep(30) 
     
     print("\n" + "═"*30)
     print("🚀 BACKGROUND PRE-WARM STARTING")
@@ -112,8 +112,8 @@ async def background_prewarm():
             # If HF is still loading (503), wait and try again
             print(f"⚠️ Pre-warm attempt {i+1} failed: {e}")
             if i < 2:
-                print("🔄 Retrying in 10 seconds...")
-                await asyncio.sleep(10)
+                print("🔄 Retrying in 20 seconds...")
+                await asyncio.sleep(20)
     
     print("❌ Background pre-warm failed after 3 attempts.")
     print("💡 Note: The first user request will trigger the model wake-up.")
