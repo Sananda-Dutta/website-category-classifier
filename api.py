@@ -42,6 +42,7 @@ import os
 import re
 import sqlite3
 import time
+import socket
 
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -163,7 +164,14 @@ async def lifespan(app: FastAPI):
 
     print("\n🚀 STATUS: API IS LIVE | RAM: ~80MB")
     print("═"*55 + "\n")
+    # Add this inside lifespan, after creating _hf_client, before the yield:
 
+    try:
+        ip = socket.getaddrinfo("api-inference.huggingface.co", 443)
+        print(f"✅ DNS resolved: api-inference.huggingface.co → {ip[0][4][0]}")
+    except Exception as e:
+        print(f"❌ DNS FAILED: {e}")
+        print("💡 Render free tier may be blocking outbound to huggingface.co")
     # --- API EXECUTION PAUSE ---
     yield 
     # ---------------------------
