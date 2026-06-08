@@ -644,6 +644,24 @@ async def smart_classify(url: str) -> tuple:
                 pass  # keep original result
 
     return category, confidence, top3, method
+# ─────────────────────────────────────────────
+# SCHEMAS
+# ─────────────────────────────────────────────
+class URLRequest(BaseModel):
+    url: str
+
+class TextRequest(BaseModel):
+    text: str
+
+class BatchURLRequest(BaseModel):
+    urls: List[str]
+
+class PredictionResult(BaseModel):
+    category:   str
+    confidence: float
+    top3:       List[dict]
+    method:     str
+    time_ms:    float
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
