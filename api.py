@@ -1,40 +1,34 @@
 # ═══════════════════════════════════════════════════════════════════════════════
-# Website Category Classifier API  —  v2.5.0
+# Website Category Classifier API  —  v2.6.0
 # Model   : DistilBERT fine-tuned (11 categories)
 # Author  : SanandaDutta
 # HF Repo : SanandaDutta/website-category-distilbert
 #
-# v2.5.0 — HuggingFace Inference API architecture
+# v2.6.0 — HuggingFace Space relay architecture
 #
-# WHY THIS CHANGE:
-#   DistilBERT (260 MB weights) + torch + transformers loading overhead
-#   consistently exceeds 512 MB during startup on Render free tier,
-#   causing OOM before the first request is ever served.
-#   Even low_cpu_mem_usage=True and int8 quantization cannot fix this
-#   because the peak occurs during torch+transformers import, before
-#   any optimisation can be applied.
+# WHY THIS CHANGE FROM v2.5.0:
+#   Render free tier blocks outbound DNS to api-inference.huggingface.co
+#   ([Errno -5] No address associated with hostname).
+#   Fix: route inference through a public HF Space (free CPU tier)
+#   which has stable outbound networking.
 #
-# NEW ARCHITECTURE:
-#   Render (this file) → thin FastAPI wrapper, ~80 MB RAM
-#   HuggingFace Hub   → hosts and runs DistilBERT, free inference API
-#   Result: 432 MB headroom on Render, zero OOM risk, faster inference
-#   (HF hardware is faster than Render free-tier CPU)
+# ARCHITECTURE:
+#   RapidAPI → Render (this file, ~80MB RAM) → HF Space relay → DistilBERT
 #
-# SPEED:
-#   Warm inference:  200–600 ms  (vs 800–1500 ms local on Render CPU)
-#   HF cold start:   8–20 s first call after idle (same as before)
-#   Domain shortcuts: 0 ms — unchanged, served instantly from this file
+# HF SPACE SETUP (one-time):
+#   1. Create Space: huggingface.co/new-space
+#      Name: wcc-inference-relay | SDK: Docker | Hardware: CPU Basic (free)
+#   2. Add these 3 files to the Space (see project docs):
+#      - app.py, requirements.txt, Dockerfile
+#   3. Wait for Space to show "Running" (~5 min first build)
 #
-# SETUP (one-time):
-#   1. Go to huggingface.co/settings/tokens
-#   2. Create a token with "Make calls to the serverless Inference API" permission
-#   3. In Render dashboard → Environment → add:
-#      HF_TOKEN = hf_xxxxxxxxxxxxxxxxxxxx
+# RENDER ENV VARS NEEDED:
+#   HF_TOKEN            = hf_xxxx  (still needed for private model access)
+#   RAPIDAPI_PROXY_SECRET = xxxx   (set when ready to publish to marketplace)
 #
-# ALL ENDPOINTS PRESERVED:
+# ALL ENDPOINTS UNCHANGED:
 #   /classify/url, /classify/text, /classify/batch, /safe-check,
-#   /explain (disabled, preserved for future), /stats, /stats/export,
-#   /health, /ping, /usage — all work identically from the caller's view.
+#   /explain, /stats, /stats/export, /health, /ping, /usage
 # ═══════════════════════════════════════════════════════════════════════════════
 
 import asyncio
@@ -42,11 +36,9 @@ import os
 import re
 import sqlite3
 import time
-import socket
 
 from contextlib import asynccontextmanager
 from datetime import datetime
-from functools import lru_cache
 from typing import List
 from urllib.parse import urlparse
 
@@ -63,10 +55,14 @@ from scraper import scrape_website, build_feature_string
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
-HF_MODEL_ID  = "SanandaDutta/website-category-distilbert"
-HF_API_URL   = f"https://api-inference.huggingface.co/models/{HF_MODEL_ID}"
-HF_TOKEN     = os.getenv("HF_TOKEN", "")          # set in Render env vars
-DB_FILE      = "usage_logs.db"
+HF_MODEL_ID = "SanandaDutta/website-category-distilbert"
+
+# ✅ v2.6.0 CHANGE: point to HF Space relay instead of HF Inference API
+# HF Space has stable outbound DNS unlike Render free tier
+HF_SPACE_URL = "https://sanandadutta-wcc-inference-relay.hf.space/classify"
+
+HF_TOKEN = os.getenv("HF_TOKEN", "")   # still needed if model is private
+DB_FILE  = "usage_logs.db"
 
 CLASS_NAMES = [
     "Adult", "Arts", "Business", "Education", "Gaming",
@@ -78,193 +74,162 @@ KIDS_CATEGORY        = "Kids"
 SAFE_FOR_KIDS        = {"Education", "Kids", "Arts", "Recreation"}
 CONFIDENCE_THRESHOLD = 45.0
 
-# Shared async HTTP client — reused across all requests (connection pooling)
-# Timeout: 25s connect, 25s read — HF cold start can take 15-20s
+# Shared async HTTP client
 _hf_client: httpx.AsyncClient = None
 
 
 # ─────────────────────────────────────────────
 # LIFESPAN
 # ─────────────────────────────────────────────
-
-# --- 1. THE BACKGROUND ENGINE ---
 async def background_prewarm():
     """
-    This function runs quietly after the API is live.
-    It solves the 'No address associated with hostname' error by waiting 
-    for Render's network to fully connect.
+    Wakes up the HF Space after startup.
+    Waits 30s for Render's network to stabilize first.
     """
-    # Wait 15 seconds to ensure Render's DNS is fully active
-    await asyncio.sleep(30) 
-    
+    await asyncio.sleep(30)
+
     print("\n" + "═"*30)
     print("🚀 BACKGROUND PRE-WARM STARTING")
     print("═"*30)
-    
+
     for i in range(3):
         try:
-            # Send dummy data to wake up the Hugging Face Model
-            await _call_hf_inference("warmup") 
-            print(f"✅ HF model is awake and ready! (Attempt {i+1})")
+            await _call_hf_inference("warmup")
+            print(f"✅ HF Space is awake and ready! (Attempt {i+1})")
             print("═"*30 + "\n")
             return
         except Exception as e:
-            # If HF is still loading (503), wait and try again
             print(f"⚠️ Pre-warm attempt {i+1} failed: {e}")
             if i < 2:
                 print("🔄 Retrying in 20 seconds...")
                 await asyncio.sleep(20)
-    
+
     print("❌ Background pre-warm failed after 3 attempts.")
-    print("💡 Note: The first user request will trigger the model wake-up.")
+    print("💡 Note: The first user request will trigger the Space wake-up.")
     print("═"*30 + "\n")
 
 
-# --- 2. THE MAIN LIFESPAN GATEWAY ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    The heart of the API. This handles everything from database 
-    initialization to the final shutdown cleanup.
-    """
     global _hf_client
 
     print("\n" + "╔" + "═"*53 + "╗")
-    print(f"║ {'WEBSITE CATEGORY CLASSIFIER v2.5.0':^51} ║")
+    print(f"║ {'WEBSITE CATEGORY CLASSIFIER v2.6.0':^51} ║")
     print("╚" + "═"*53 + "╝")
 
-    # PHASE A: Database Initialization
+    # PHASE A: Database
     try:
         init_db()
         print("📁 [1/4] SQLite Database: Ready")
     except Exception as e:
         print(f"❌ [1/4] SQLite Database: FAILED ({e})")
 
-    # PHASE B: Credentials & Environment Validation
+    # PHASE B: Credentials
     if not HF_TOKEN:
-        print("🚫 [2/4] Credentials: HF_TOKEN MISSING (API will fail)")
+        print("⚠️  [2/4] HF_TOKEN not set (ok if Space model is public)")
     else:
         print(f"🔑 [2/4] Credentials: HF_TOKEN Verified")
-        print(f"🤖 [2/4] Model Target: {HF_MODEL_ID}")
+    print(f"🤖 [2/4] Relay Target: {HF_SPACE_URL}")
 
-    # PHASE C: Establish Persistent Network Connection
-    # We create the client here so it's ready before the yield
+    # PHASE C: HTTP client — ✅ NO Authorization header (Space is public)
     _hf_client = httpx.AsyncClient(
-        timeout=httpx.Timeout(connect=25.0, read=25.0, write=10.0, pool=5.0),
-        headers={"Authorization": f"Bearer {HF_TOKEN}"},
+        timeout=httpx.Timeout(connect=30.0, read=60.0, write=10.0, pool=5.0),
         limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
     )
-    print("🌐 [3/4] Network: HTTPX Client Initialized")
+    print("🌐 [3/4] Network: HTTPX Client Initialized (no auth — Space is public)")
 
-    # PHASE D: Trigger the Background Pre-Warm
-    # CRITICAL: No 'await' here. This lets the function run in the 
-    # background while we move on to 'yield' (making the API live).
+    # PHASE D: Background pre-warm
     asyncio.create_task(background_prewarm())
     print("🛰️ [4/4] AI Engine: Background pre-warm scheduled")
 
     print("\n🚀 STATUS: API IS LIVE | RAM: ~80MB")
     print("═"*55 + "\n")
-    # Add this inside lifespan, after creating _hf_client, before the yield:
 
-    try:
-        ip = socket.getaddrinfo("api-inference.huggingface.co", 443)
-        print(f"✅ DNS resolved: api-inference.huggingface.co → {ip[0][4][0]}")
-    except Exception as e:
-        print(f"❌ DNS FAILED: {e}")
-        print("💡 Render free tier may be blocking outbound to huggingface.co")
-    # --- API EXECUTION PAUSE ---
-    yield 
-    # ---------------------------
+    yield
 
-    # PHASE E: Graceful Shutdown
-    # This runs when you stop the server or Render redeploys
     await _hf_client.aclose()
     print("\n" + "═"*55)
     print("🛑 SHUTDOWN: HTTPX Client Closed. Service Offline.")
     print("═"*55)
+
+
 # ─────────────────────────────────────────────
-# HF INFERENCE API CALLER
+# HF SPACE CALLER  (v2.6.0 — replaces HF Inference API caller)
 # ─────────────────────────────────────────────
 async def _call_hf_inference(text: str) -> list:
     """
-    Calls HuggingFace Inference API for text classification.
+    Calls the HF Space relay for text classification.
+    Space endpoint: POST /classify  body: {"inputs": "..."}
     Returns list of {"label": str, "score": float} sorted by score desc.
 
     Handles:
-    - 503 model loading (retries up to 3x with backoff)
-    - 429 rate limit (waits estimated_time then retries)
+    - 503 Space loading/sleeping (retries up to 3x with backoff)
+    - 429 rate limit
     - Timeout (raises HTTPException 504)
-    - Auth error (raises HTTPException 500 with clear message)
     """
-    payload = {"inputs": text[:512]}   # HF has 512 token limit
+    if _hf_client is None:
+        raise HTTPException(503, "HTTP client not initialized. Check startup logs.")
+
+    payload = {"inputs": text[:512]}
 
     for attempt in range(3):
         try:
-            r = await _hf_client.post(HF_API_URL, json=payload)
+            r = await _hf_client.post(HF_SPACE_URL, json=payload)
 
-            # Model still loading on HF side — wait and retry
+            # Space sleeping or building — wait and retry
             if r.status_code == 503:
-                data = r.json() if r.content else {}
-                wait = min(data.get("estimated_time", 15), 20)
-                print(f"HF model loading, waiting {wait}s (attempt {attempt+1}/3)")
+                wait = 20
+                try:
+                    wait = min(r.json().get("estimated_time", 20), 30)
+                except Exception:
+                    pass
+                print(f"HF Space loading, waiting {wait}s (attempt {attempt+1}/3)")
                 await asyncio.sleep(wait)
                 continue
 
             # Rate limited
             if r.status_code == 429:
-                data = r.json() if r.content else {}
-                wait = min(data.get("estimated_time", 5), 10)
-                await asyncio.sleep(wait)
+                await asyncio.sleep(10)
                 continue
 
-            # Auth error — token missing or wrong
-            if r.status_code == 401:
-                raise HTTPException(500,
-                    "HuggingFace auth failed. Check HF_TOKEN in Render env vars.")
-
             r.raise_for_status()
-
             results = r.json()
 
-            # HF text-classification returns [[{label,score},...]] or [{label,score},...]
+            # ✅ Space returns [{label, score}, ...] directly
+            # Handle both formats just in case
             if isinstance(results, list) and results:
                 if isinstance(results[0], list):
                     results = results[0]
-                # Sort by score descending (should already be sorted, but ensure it)
                 results.sort(key=lambda x: x["score"], reverse=True)
                 return results
 
-            raise ValueError(f"Unexpected HF response format: {results}")
+            raise ValueError(f"Unexpected Space response format: {results}")
 
         except httpx.TimeoutException:
             if attempt == 2:
                 raise HTTPException(504,
-                    "HuggingFace Inference API timed out. "
-                    "Model may be cold — retry in 20 seconds.")
+                    "HF Space timed out. Space may be cold — retry in 30 seconds.")
             await asyncio.sleep(5)
             continue
 
         except HTTPException:
             raise
+
         except Exception as e:
             import traceback
-            print(f"[HF ERROR attempt {attempt}] {type(e).__name__}: {e}")
+            print(f"[HF ERROR attempt {attempt+1}] {type(e).__name__}: {e}")
             print(traceback.format_exc())
             if attempt == 2:
-                raise HTTPException(500, f"HF Inference API error: {str(e)}")
+                raise HTTPException(500, f"HF Inference error: {str(e)}")
             await asyncio.sleep(3)
             continue
 
-    raise HTTPException(503, "HuggingFace Inference API unavailable after 3 retries.")
+    raise HTTPException(503, "HF Space unavailable after 3 retries.")
 
 
 # ─────────────────────────────────────────────
-# PREDICTION  (LRU cached — same interface as before)
+# PREDICTION CACHE
 # ─────────────────────────────────────────────
-# Note: lru_cache requires sync function. We cache the result after
-# the async HF call returns. The cache key is the feature string,
-# so repeated URLs are served instantly without hitting HF API again.
-
 _prediction_cache: dict = {}
 _cache_lock = asyncio.Lock()
 MAX_CACHE_SIZE = 1024
@@ -272,17 +237,13 @@ MAX_CACHE_SIZE = 1024
 async def run_prediction(feature_string: str) -> tuple:
     """
     Returns (category, confidence_%, top3_list).
-    Async-safe LRU cache — HF API only called on cache miss.
-    Cache size capped at MAX_CACHE_SIZE entries (FIFO eviction).
+    Async-safe cache — Space only called on cache miss.
     """
-    # Fast path — no lock needed for reads on dict in CPython
     if feature_string in _prediction_cache:
         return _prediction_cache[feature_string]
 
-    # Cache miss — call HF API
     results = await _call_hf_inference(feature_string)
 
-    # Parse response into our standard format
     top3 = [
         {
             "category":   r["label"],
@@ -294,10 +255,8 @@ async def run_prediction(feature_string: str) -> tuple:
     confidence = top3[0]["confidence"]
     result     = (category, confidence, top3)
 
-    # Store in cache (evict oldest if full)
     async with _cache_lock:
         if len(_prediction_cache) >= MAX_CACHE_SIZE:
-            # Remove oldest 10% of entries
             evict_count = MAX_CACHE_SIZE // 10
             for key in list(_prediction_cache.keys())[:evict_count]:
                 del _prediction_cache[key]
@@ -370,7 +329,7 @@ app = FastAPI(
         "[HuggingFace](https://huggingface.co/SanandaDutta) · "
         "[GitHub](https://github.com/SanandaDutta)"
     ),
-    version="2.5.0",
+    version="2.6.0",
     lifespan=lifespan,
 )
 
@@ -383,7 +342,8 @@ async def verify_rapidapi_proxy(request: Request, call_next):
                   "/", "/ping", "/usage"}
     if RAPIDAPI_SECRET and request.url.path not in skip_paths:
         incoming = request.headers.get("X-RapidAPI-Proxy-Secret", "").strip()
-        print(f"[AUTH] path={request.url.path} incoming={repr(incoming)} expected={repr(RAPIDAPI_SECRET)} match={incoming == RAPIDAPI_SECRET}")
+        print(f"[AUTH] path={request.url.path} incoming={repr(incoming)} "
+              f"expected={repr(RAPIDAPI_SECRET)} match={incoming == RAPIDAPI_SECRET}")
         if incoming != RAPIDAPI_SECRET:
             return JSONResponse(status_code=403, content={
                 "error": "Access via RapidAPI only. Sign up at rapidapi.com"
@@ -406,7 +366,7 @@ async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
 
 
 # ─────────────────────────────────────────────
-# DOMAIN / PATH SHORTCUTS  (served locally — no HF call needed)
+# DOMAIN / PATH SHORTCUTS
 # ─────────────────────────────────────────────
 PATH_SHORTCUTS = {
     "bbc.co.uk/sport":      "Recreation",
@@ -628,22 +588,19 @@ def filter_noise(text: str) -> str:
 async def smart_classify(url: str) -> tuple:
     """
     Returns (category, confidence, top3, method).
-    Shortcuts served locally (0 ms). Unknown domains call HF API.
+    Shortcuts served locally (0 ms). Unknown domains call HF Space.
     """
     domain           = get_domain(url)
     domain_with_path = get_domain_with_path(url)
 
-    # Path-aware shortcut
     if domain_with_path in PATH_SHORTCUTS:
         cat = PATH_SHORTCUTS[domain_with_path]
         return cat, 99.0, [{"category": cat, "confidence": 99.0}], "path_shortcut"
 
-    # Bare domain shortcut
     if domain in DOMAIN_SHORTCUTS:
         cat = DOMAIN_SHORTCUTS[domain]
         return cat, 99.0, [{"category": cat, "confidence": 99.0}], "domain_shortcut"
 
-    # Scrape + feature extraction
     try:
         scraped = scrape_website(url)
     except Exception:
@@ -661,7 +618,6 @@ async def smart_classify(url: str) -> tuple:
 
     category, confidence, top3 = await run_prediction(features)
 
-    # Low-confidence fallback
     if confidence < CONFIDENCE_THRESHOLD and method == "combined_features":
         url_features = extract_url_features(url)
         if url_features.strip():
@@ -700,34 +656,34 @@ class PredictionResult(BaseModel):
 @app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
 async def root(request: Request):
     return {
-        "message"     : "Website Category Classifier API v2.5.0",
-        "architecture": "HuggingFace Inference API (Render RAM: ~80 MB)",
+        "message"     : "Website Category Classifier API v2.6.0",
+        "architecture": "HF Space Relay (Render RAM: ~80 MB)",
         "classes"     : CLASS_NAMES,
         "docs"        : "/docs",
     }
 
 @app.api_route("/ping", methods=["GET", "HEAD"], tags=["Info"])
 async def ping(request: Request):
-    return {"status": "alive", "version": "2.5.0"}
+    return {"status": "alive", "version": "2.6.0"}
 
 @app.api_route("/health", methods=["GET", "HEAD"], tags=["Info"])
 async def health(request: Request):
     return {
-        "status"          : "ok",
-        "version"         : "2.5.0",
-        "architecture"    : "hf_inference_api",
-        "hf_model"        : HF_MODEL_ID,
-        "hf_token_set"    : bool(HF_TOKEN),
-        "classes"         : CLASS_NAMES,
-        "cache_size"      : len(_prediction_cache),
-        "cache_max"       : MAX_CACHE_SIZE,
+        "status"       : "ok",
+        "version"      : "2.6.0",
+        "architecture" : "hf_space_relay",
+        "hf_space"     : HF_SPACE_URL,
+        "hf_model"     : HF_MODEL_ID,
+        "classes"      : CLASS_NAMES,
+        "cache_size"   : len(_prediction_cache),
+        "cache_max"    : MAX_CACHE_SIZE,
     }
 
 @app.get("/usage", tags=["Info"])
 async def usage_info():
     return {
         "name":       "Website Category Classifier",
-        "version":    "2.5.0",
+        "version":    "2.6.0",
         "categories": CLASS_NAMES,
         "endpoints": {
             "POST /classify/url":   "Classify a live website by URL",
@@ -880,16 +836,12 @@ async def safe_check(request: Request, body: URLRequest):
         raise HTTPException(500, f"Internal error: {str(e)}")
 
 
-# ── 5. /explain  (disabled — LIME needs local model) ─────────────────────────
-# When you move to a paid plan and load the model locally again,
-# restore the full LIME implementation from v2.3.0.
+# ── 5. /explain ───────────────────────────────
 @app.api_route("/explain", methods=["GET", "POST"], tags=["XAI"])
 async def explain(request: Request):
     return JSONResponse(status_code=503, content={
-        "error"      : "LIME explanation unavailable in HF Inference API mode.",
-        "reason"     : "LIME requires local model access. Currently using HF API to stay within 512 MB RAM.",
-        "workaround" : "Use top3 from /classify/url — it shows the top 3 category scores.",
-        "re_enable"  : "Load model locally (requires 1 GB+ RAM plan) and restore v2.3.0 LIME code.",
+        "error"      : "LIME explanation unavailable in HF Space relay mode.",
+        "workaround" : "Use top3 from /classify/url for the top 3 category scores.",
     })
 
 
