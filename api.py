@@ -239,6 +239,9 @@ async def _call_hf_inference(text: str) -> list:
         except HTTPException:
             raise
         except Exception as e:
+            import traceback
+            print(f"[HF ERROR attempt {attempt}] {type(e).__name__}: {e}")
+            print(traceback.format_exc())
             if attempt == 2:
                 raise HTTPException(500, f"HF Inference API error: {str(e)}")
             await asyncio.sleep(3)
