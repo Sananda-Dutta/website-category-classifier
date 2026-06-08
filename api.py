@@ -601,9 +601,12 @@ async def smart_classify(url: str) -> tuple:
         cat = DOMAIN_SHORTCUTS[domain]
         return cat, 99.0, [{"category": cat, "confidence": 99.0}], "domain_shortcut"
 
+    # Try scraping
+    scraped = {}
     try:
         scraped = scrape_website(url)
-    except Exception:
+    except Exception as scrape_err:
+        print(f"[SCRAPE FAILED] {url}: {scrape_err}")
         scraped = {"error": "SCRAPE_FAILED"}
 
     if scraped.get("error"):
@@ -613,40 +616,34 @@ async def smart_classify(url: str) -> tuple:
         features = build_weighted_features(scraped, url)
         method   = "combined_features"
 
+    # Last resort: if still no features, use raw domain as input
     if not features.strip():
-        raise HTTPException(422, "Could not extract any features from this URL.")
+        features = domain.replace(".", " ").replace("-", " ")
+        method   = "domain_name_only"
 
-    category, confidence, top3 = await run_prediction(features)
+    # If truly nothing, return a generic result rather than raising 422
+    if not features.strip():
+        return "Technology", 30.0, [{"category": "Technology", "confidence": 30.0}], "fallback"
+
+    try:
+        category, confidence, top3 = await run_prediction(features)
+    except HTTPException as he:
+        # HF Space is down/cold — return graceful fallback
+        print(f"[HF ERROR in smart_classify] {he.detail}")
+        return "Technology", 30.0, [{"category": "Technology", "confidence": 30.0}], "hf_error_fallback"
 
     if confidence < CONFIDENCE_THRESHOLD and method == "combined_features":
         url_features = extract_url_features(url)
         if url_features.strip():
-            cat_url, conf_url, top3_url = await run_prediction(url_features)
-            if conf_url > confidence:
-                category, confidence, top3 = cat_url, conf_url, top3_url
-                method = "url_features_fallback"
+            try:
+                cat_url, conf_url, top3_url = await run_prediction(url_features)
+                if conf_url > confidence:
+                    category, confidence, top3 = cat_url, conf_url, top3_url
+                    method = "url_features_fallback"
+            except Exception:
+                pass  # keep original result
 
     return category, confidence, top3, method
-
-
-# ─────────────────────────────────────────────
-# SCHEMAS
-# ─────────────────────────────────────────────
-class URLRequest(BaseModel):
-    url: str
-
-class TextRequest(BaseModel):
-    text: str
-
-class BatchURLRequest(BaseModel):
-    urls: List[str]
-
-class PredictionResult(BaseModel):
-    category:   str
-    confidence: float
-    top3:       List[dict]
-    method:     str
-    time_ms:    float
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
