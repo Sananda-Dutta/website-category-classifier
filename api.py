@@ -37,6 +37,8 @@ import re
 import sqlite3
 import time
 
+from auth import verify_api_credentials
+
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import List
@@ -77,6 +79,97 @@ CONFIDENCE_THRESHOLD = 45.0
 # Shared async HTTP client
 _hf_client: httpx.AsyncClient = None
 
+CATEGORY_KEYWORDS = {
+    "Gaming": [
+        "game", "games", "gaming", "play", "player", "multiplayer",
+        "arcade", "puzzle", "adventure", "fps", "rpg", "leaderboard",
+        "score", "level", "quest", "boss", "spawn", "loot", "esports",
+        "browser game", "online game", "free game", "playthrough",
+        "speedrun", "controller", "joystick", "console", "gamepad",
+    ],
+    "News": [
+        "news", "breaking", "headline", "reporter", "journalist",
+        "article", "politics", "election", "world news", "local news",
+        "latest", "update", "press", "media", "editorial",
+        "correspondent", "bulletin", "dispatch", "coverage", "report",
+    ],
+    "Education": [
+        "learn", "course", "tutorial", "lecture", "student", "teacher",
+        "university", "college", "school", "exam", "study", "quiz",
+        "lesson", "curriculum", "degree", "certificate", "mooc",
+        "assignment", "textbook", "syllabus", "classroom", "e-learning",
+    ],
+    "Arts": [
+        "art", "artwork", "painting", "illustration", "sculpture",
+        "photography", "gallery", "museum", "exhibition", "creative",
+        "design", "drawing", "sketch", "animation", "film", "music",
+        "song", "album", "poetry", "literature", "theater", "dance",
+        "craft", "portfolio", "canvas", "palette",
+    ],
+    "Business": [
+        "business", "company", "startup", "enterprise", "corporate",
+        "revenue", "profit", "investor", "funding", "vc", "b2b",
+        "saas", "market", "strategy", "management", "ceo", "founder",
+        "acquisition", "ipo", "valuation", "consulting", "finance",
+        "budget", "sales", "marketing", "brand", "client",
+    ],
+    "Health": [
+        "health", "medical", "doctor", "patient", "hospital", "medicine",
+        "symptom", "diagnosis", "treatment", "wellness", "fitness",
+        "nutrition", "diet", "mental health", "therapy", "clinic",
+        "pharmacy", "drug", "disease", "condition", "surgery", "nurse",
+        "prescription", "vaccine", "chronic", "recovery",
+    ],
+    "Kids": [
+        "kids", "children", "child", "toddler", "preschool", "kindergarten",
+        "cartoon", "nursery", "bedtime", "story", "toy", "playground",
+        "safe for kids", "family friendly", "parental", "disney",
+        "nick jr", "pbs kids", "sesame", "learning for kids",
+    ],
+    "Lifestyle": [
+        "lifestyle", "fashion", "beauty", "style", "recipe", "food",
+        "cooking", "home decor", "interior", "relationship", "dating",
+        "wedding", "parenting", "self-help", "motivation", "mindfulness",
+        "yoga", "skincare", "makeup", "outfit", "trend", "vlog",
+        "influencer", "blogging", "wellness", "personal growth",
+    ],
+    "Recreation": [
+        "sport", "sports", "football", "cricket", "tennis", "basketball",
+        "soccer", "match", "tournament", "league", "team", "athlete",
+        "stadium", "championship", "olympic", "travel", "adventure",
+        "hiking", "camping", "outdoor", "fishing", "cycling", "gym",
+        "workout", "training", "hobby", "club", "recreation",
+    ],
+    "Technology": [
+        "software", "hardware", "developer", "api", "code", "programming",
+        "tech", "cloud", "data", "ai", "machine learning", "open source",
+        "devops", "cybersecurity", "blockchain", "saas", "platform",
+        "framework", "library", "database", "server", "linux", "python",
+        "javascript", "github", "deployment", "docker", "kubernetes",
+    ],
+    "Adult": [
+        # intentionally sparse — rely on model + confidence threshold
+        "adult content", "18+", "explicit", "nsfw", "xxx",
+    ],
+}
+
+def keyword_fallback(text: str) -> tuple[str, float]:
+    text_lower = text.lower()
+    scores = {}
+    for category, keywords in CATEGORY_KEYWORDS.items():
+        if category == "Adult":
+            continue  # never assign Adult via keyword fallback
+        score = sum(1 for kw in keywords if kw in text_lower)
+        if score > 0:
+            scores[category] = score
+
+    if not scores:
+        return None, 0.0
+
+    best = max(scores, key=scores.get)
+    # normalize: 5+ keyword hits = full confidence
+    confidence = min(scores[best] / 5.0, 1.0)
+    return best, round(confidence * 100, 2)
 
 # ─────────────────────────────────────────────
 # LIFESPAN
@@ -419,6 +512,18 @@ DOMAIN_SHORTCUTS = {
     "meesho.com":"Business","myntra.com":"Business","ajio.com":"Business",
     "nykaa.com":"Business","linkedin.com":"Business",
     "shopify.com":"Business","stripe.com":"Business",
+    "linkedin.com": "Business",
+    "bloomberg.com": "Business",
+    "forbes.com": "Business",
+    "businessinsider.com": "Business",
+    "entrepreneur.com": "Business",
+    "hbr.org": "Business",
+    "crunchbase.com": "Business",
+    "glassdoor.com": "Business",
+    "indeed.com": "Business",
+    "upwork.com": "Business",
+    "fiverr.com": "Business",
+    "shopify.com": "Business",
     # Technology
     "github.com":"Technology","stackoverflow.com":"Technology",
     "geeksforgeeks.org":"Technology","hackerrank.com":"Technology",
@@ -439,12 +544,34 @@ DOMAIN_SHORTCUTS = {
     "udemy.com":"Education","edx.org":"Education",
     "britannica.com":"Education","collegedunia.com":"Education",
     "shiksha.com":"Education","careers360.com":"Education",
+    "khanacademy.org": "Education",
+    "coursera.org": "Education",
+    "edx.org": "Education",
+    "udemy.com": "Education",
+    "nptel.ac.in": "Education",
+    "brilliant.org": "Education",
+    "duolingo.com": "Education",
+    "quizlet.com": "Education",
+    "wolframalpha.com": "Education",
+    "britannica.com": "Education",
+    "wikipedia.org": "Education",
+    "scholar.google.com": "Education",
     # Health
     "practo.com":"Health","1mg.com":"Health","netmeds.com":"Health",
     "apollohospitals.com":"Health","webmd.com":"Health",
     "healthline.com":"Health","pharmeasy.in":"Health",
     "cult.fit":"Health","medscape.com":"Health",
     "mayoclinic.org":"Health","nih.gov":"Health",
+    "webmd.com": "Health",
+    "healthline.com": "Health",
+    "mayoclinic.org": "Health",
+    "medlineplus.gov": "Health",
+    "nih.gov": "Health",
+    "who.int": "Health",
+    "medscape.com": "Health",
+    "practo.com": "Health",
+    "1mg.com": "Health",
+    "netmeds.com": "Health"
     # Gaming
     "dream11.com":"Gaming","mpl.live":"Gaming","winzo.com":"Gaming",
     "zupee.com":"Gaming","rummycircle.com":"Gaming","adda52.com":"Gaming",
@@ -457,6 +584,17 @@ DOMAIN_SHORTCUTS = {
     "bcci.tv":"Recreation","iplt20.com":"Recreation",
     "espn.com":"Recreation","bleacherreport.com":"Recreation",
     "fifa.com":"Recreation","olympics.com":"Recreation",
+    "tripadvisor.com": "Recreation",
+    "booking.com": "Recreation",
+    "airbnb.com": "Recreation",
+    "rei.com": "Recreation",
+    "alltrails.com": "Recreation",
+    "strava.com": "Recreation",
+    "espn.com": "Recreation",
+    "cricbuzz.com": "Recreation",
+    "espncricinfo.com": "Recreation",
+    "fifa.com": "Recreation",
+    "icc-cricket.com": "Recreation",
     # Lifestyle
     "zomato.com":"Lifestyle","swiggy.com":"Lifestyle",
     "makemytrip.com":"Lifestyle","irctc.co.in":"Lifestyle",
@@ -465,10 +603,29 @@ DOMAIN_SHORTCUTS = {
     "instagram.com":"Lifestyle","pinterest.com":"Lifestyle",
     "tripadvisor.com":"Lifestyle","booking.com":"Lifestyle",
     "airbnb.com":"Lifestyle","uber.com":"Lifestyle",
+    "buzzfeed.com": "Lifestyle",
+    "cosmopolitan.com": "Lifestyle",
+    "vogue.com": "Lifestyle",
+    "elle.com": "Lifestyle",
+    "allrecipes.com": "Lifestyle",
+    "food.com": "Lifestyle",
+    "tasty.co": "Lifestyle",
+    "goodhousekeeping.com": "Lifestyle",
+    "realsimple.com": "Lifestyle",
+    "mindbodygreen.com": "Lifestyle",
     # Kids
     "firstcry.com":"Kids","nickelodeonindia.com":"Kids",
     "tinkle.in":"Kids","amarchitrakatha.com":"Kids",
     "disneyindia.in":"Kids","pbs.org":"Kids","starfall.com":"Kids",
+    "pbskids.org": "Kids",
+    "nickjr.com": "Kids",
+    "cartoonnetwork.com": "Kids",
+    "disney.com": "Kids",
+    "starfall.com": "Kids",
+    "funbrain.com": "Kids",
+    "abcmouse.com": "Kids",
+    "sesamestreet.org": "Kids",
+    "natgeokids.com": "Kids",
     # Arts
     "gaana.com":"Arts","saavn.com":"Arts","jiosavan.com":"Arts",
     "filmfare.com":"Arts","bollywoodhungama.com":"Arts",
@@ -478,6 +635,32 @@ DOMAIN_SHORTCUTS = {
     "disneyplus.com":"Arts","zee5.com":"Arts",
     "sonyliv.com":"Arts","voot.com":"Arts","spotify.com":"Arts",
     "imdb.com":"Arts","rottentomatoes.com":"Arts",
+    "deviantart.com": "Arts",
+    "behance.net": "Arts",
+    "dribbble.com": "Arts",
+    "artstation.com": "Arts",
+    "pinterest.com": "Arts",
+    "unsplash.com": "Arts",
+    "flickr.com": "Arts",
+    "500px.com": "Arts",
+    "vimeo.com": "Arts",
+    "soundcloud.com": "Arts",
+    "bandcamp.com": "Arts",
+    #gaming
+    "poki.com": "Gaming",
+    "miniclip.com": "Gaming",
+    "kongregate.com": "Gaming",
+    "newgrounds.com": "Gaming",
+    "steampowered.com": "Gaming",
+    "itch.io": "Gaming",
+    "epicgames.com": "Gaming",
+    "roblox.com": "Gaming",
+    "chess.com": "Gaming",
+    "friv.com": "Gaming",
+    "coolmathgames.com": "Gaming",
+    "y8.com": "Gaming",
+    "addictinggames.com": "Gaming",
+    "armor games.com": "Gaming",
 }
 
 
@@ -632,6 +815,7 @@ async def smart_classify(url: str) -> tuple:
         print(f"[HF ERROR in smart_classify] {he.detail}")
         return "Technology", 30.0, [{"category": "Technology", "confidence": 30.0}], "hf_error_fallback"
 
+    # 1. First fallback: Try parsing just the URL structure if the combined features failed
     if confidence < CONFIDENCE_THRESHOLD and method == "combined_features":
         url_features = extract_url_features(url)
         if url_features.strip():
@@ -642,6 +826,22 @@ async def smart_classify(url: str) -> tuple:
                     method = "url_features_fallback"
             except Exception:
                 pass  # keep original result
+
+    # 2. Second fallback: If STILL below threshold, use your custom keyword rules
+    if confidence < CONFIDENCE_THRESHOLD:
+        fallback_cat, fallback_conf = keyword_fallback(extracted_text)
+        if fallback_cat and fallback_conf >= 30.0:
+            category = fallback_cat
+            confidence = fallback_conf
+            method = "keyword_fallback"
+        else:
+            # If keywords didn't cross 30%, keep the best model guess but tag it
+            if method != "url_features_fallback":
+                method = "model_low_confidence"
+    else:
+        # If it was high confidence from the start and didn't use the URL fallback
+        if method != "url_features_fallback":
+            method = "model"
 
     return category, confidence, top3, method
 # ─────────────────────────────────────────────
@@ -721,6 +921,7 @@ async def usage_info():
 async def classify_url(request: Request, body: URLRequest):
     start = time.time()
     ip    = get_ip(request)
+    
     try:
         url = body.url.strip()
         if not is_valid_url(url):
@@ -739,6 +940,7 @@ async def classify_url(request: Request, body: URLRequest):
     except Exception as e:
         log_request(ip, "/classify/url", False, 0, input_url=body.url)
         raise HTTPException(500, f"Internal error: {str(e)}")
+    
 
 
 # ── 2. POST /classify/text ────────────────────
