@@ -1,30 +1,31 @@
 # ═══════════════════════════════════════════════════════════════════════════════
-# Website Category Classifier API  —  v2.6.0
+# Website Category Classifier API  —  v2.7.0
 # Model   : DistilBERT fine-tuned (11 categories)
 # Author  : SanandaDutta
 # HF Repo : SanandaDutta/website-category-distilbert
 #
-# v2.6.0 — HuggingFace Space relay architecture
+# v2.7.0 — Model retrained on verified Indian + global URLs
+#           Test accuracy: 85.4% | Val accuracy: 91.8% (June 2026)
 #
-# WHY THIS CHANGE FROM v2.5.0:
+# CHANGES FROM v2.6.0:
+#   - Model retrained on clean verified data (no DMOZ noise)
+#   - Fixed: keyword_fallback was referencing undefined `extracted_text`
+#   - Fixed: missing comma in DOMAIN_SHORTCUTS (syntax error)
+#   - Fixed: duplicate domain keys cleaned up
+#   - Added: more Adult domain shortcuts
+#   - Version bumped to v2.7.0
+#
+# ARCHITECTURE (unchanged from v2.6.0):
+#   RapidAPI → Render (this file, ~80MB RAM) → HF Space relay → DistilBERT
+#
+# WHY HF SPACE RELAY:
 #   Render free tier blocks outbound DNS to api-inference.huggingface.co
-#   ([Errno -5] No address associated with hostname).
 #   Fix: route inference through a public HF Space (free CPU tier)
 #   which has stable outbound networking.
 #
-# ARCHITECTURE:
-#   RapidAPI → Render (this file, ~80MB RAM) → HF Space relay → DistilBERT
-#
-# HF SPACE SETUP (one-time):
-#   1. Create Space: huggingface.co/new-space
-#      Name: wcc-inference-relay | SDK: Docker | Hardware: CPU Basic (free)
-#   2. Add these 3 files to the Space (see project docs):
-#      - app.py, requirements.txt, Dockerfile
-#   3. Wait for Space to show "Running" (~5 min first build)
-#
 # RENDER ENV VARS NEEDED:
-#   HF_TOKEN            = hf_xxxx  (still needed for private model access)
-#   RAPIDAPI_PROXY_SECRET = xxxx   (set when ready to publish to marketplace)
+#   HF_TOKEN              = hf_xxxx  (needed if model is private)
+#   RAPIDAPI_PROXY_SECRET = xxxx     (set when publishing to marketplace)
 #
 # ALL ENDPOINTS UNCHANGED:
 #   /classify/url, /classify/text, /classify/batch, /safe-check,
@@ -59,11 +60,9 @@ from scraper import scrape_website, build_feature_string
 # ─────────────────────────────────────────────
 HF_MODEL_ID = "SanandaDutta/website-category-distilbert"
 
-# ✅ v2.6.0 CHANGE: point to HF Space relay instead of HF Inference API
-# HF Space has stable outbound DNS unlike Render free tier
 HF_SPACE_URL = "https://sanandadutta-wcc-inference-relay.hf.space/classify"
 
-HF_TOKEN = os.getenv("HF_TOKEN", "")   # still needed if model is private
+HF_TOKEN = os.getenv("HF_TOKEN", "")
 DB_FILE  = "usage_logs.db"
 
 CLASS_NAMES = [
@@ -148,8 +147,8 @@ CATEGORY_KEYWORDS = {
         "javascript", "github", "deployment", "docker", "kubernetes",
     ],
     "Adult": [
-        # intentionally sparse — rely on model + confidence threshold
         "adult content", "18+", "explicit", "nsfw", "xxx",
+        "porn", "hentai", "nude", "erotic", "onlyfans",
     ],
 }
 
@@ -167,18 +166,14 @@ def keyword_fallback(text: str) -> tuple[str, float]:
         return None, 0.0
 
     best = max(scores, key=scores.get)
-    # normalize: 5+ keyword hits = full confidence
     confidence = min(scores[best] / 5.0, 1.0)
     return best, round(confidence * 100, 2)
+
 
 # ─────────────────────────────────────────────
 # LIFESPAN
 # ─────────────────────────────────────────────
 async def background_prewarm():
-    """
-    Wakes up the HF Space after startup.
-    Waits 30s for Render's network to stabilize first.
-    """
     await asyncio.sleep(30)
 
     print("\n" + "═"*30)
@@ -207,7 +202,7 @@ async def lifespan(app: FastAPI):
     global _hf_client
 
     print("\n" + "╔" + "═"*53 + "╗")
-    print(f"║ {'WEBSITE CATEGORY CLASSIFIER v2.6.0':^51} ║")
+    print(f"║ {'WEBSITE CATEGORY CLASSIFIER v2.7.0':^51} ║")
     print("╚" + "═"*53 + "╝")
 
     # PHASE A: Database
@@ -224,7 +219,7 @@ async def lifespan(app: FastAPI):
         print(f"🔑 [2/4] Credentials: HF_TOKEN Verified")
     print(f"🤖 [2/4] Relay Target: {HF_SPACE_URL}")
 
-    # PHASE C: HTTP client — ✅ NO Authorization header (Space is public)
+    # PHASE C: HTTP client
     _hf_client = httpx.AsyncClient(
         timeout=httpx.Timeout(connect=30.0, read=60.0, write=10.0, pool=5.0),
         limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
@@ -235,7 +230,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(background_prewarm())
     print("🛰️ [4/4] AI Engine: Background pre-warm scheduled")
 
-    print("\n🚀 STATUS: API IS LIVE | RAM: ~80MB")
+    print("\n🚀 STATUS: API IS LIVE | RAM: ~80MB | MODEL: v2.7.0 (85.4% accuracy)")
     print("═"*55 + "\n")
 
     yield
@@ -247,19 +242,9 @@ async def lifespan(app: FastAPI):
 
 
 # ─────────────────────────────────────────────
-# HF SPACE CALLER  (v2.6.0 — replaces HF Inference API caller)
+# HF SPACE CALLER
 # ─────────────────────────────────────────────
 async def _call_hf_inference(text: str) -> list:
-    """
-    Calls the HF Space relay for text classification.
-    Space endpoint: POST /classify  body: {"inputs": "..."}
-    Returns list of {"label": str, "score": float} sorted by score desc.
-
-    Handles:
-    - 503 Space loading/sleeping (retries up to 3x with backoff)
-    - 429 rate limit
-    - Timeout (raises HTTPException 504)
-    """
     if _hf_client is None:
         raise HTTPException(503, "HTTP client not initialized. Check startup logs.")
 
@@ -269,7 +254,6 @@ async def _call_hf_inference(text: str) -> list:
         try:
             r = await _hf_client.post(HF_SPACE_URL, json=payload)
 
-            # Space sleeping or building — wait and retry
             if r.status_code == 503:
                 wait = 20
                 try:
@@ -280,7 +264,6 @@ async def _call_hf_inference(text: str) -> list:
                 await asyncio.sleep(wait)
                 continue
 
-            # Rate limited
             if r.status_code == 429:
                 await asyncio.sleep(10)
                 continue
@@ -288,8 +271,6 @@ async def _call_hf_inference(text: str) -> list:
             r.raise_for_status()
             results = r.json()
 
-            # ✅ Space returns [{label, score}, ...] directly
-            # Handle both formats just in case
             if isinstance(results, list) and results:
                 if isinstance(results[0], list):
                     results = results[0]
@@ -328,10 +309,6 @@ _cache_lock = asyncio.Lock()
 MAX_CACHE_SIZE = 1024
 
 async def run_prediction(feature_string: str) -> tuple:
-    """
-    Returns (category, confidence_%, top3_list).
-    Async-safe cache — Space only called on cache miss.
-    """
     if feature_string in _prediction_cache:
         return _prediction_cache[feature_string]
 
@@ -416,13 +393,14 @@ app = FastAPI(
     title="Website Category Classifier API",
     description=(
         "Classify any website into 11 categories using DistilBERT.\n\n"
+        "**Model accuracy: 85.4% test | 91.8% val** (retrained June 2026)\n\n"
         "**Categories:** Adult · Arts · Business · Education · Gaming · "
         "Health · Kids · Lifestyle · News · Recreation · Technology\n\n"
         "Built by **SanandaDutta** — "
         "[HuggingFace](https://huggingface.co/SanandaDutta) · "
         "[GitHub](https://github.com/SanandaDutta)"
     ),
-    version="2.6.0",
+    version="2.7.0",
     lifespan=lifespan,
 )
 
@@ -480,187 +458,272 @@ PATH_SHORTCUTS = {
 }
 
 DOMAIN_SHORTCUTS = {
-    # AI / Modern Tech
-    "claude.ai":"Technology","anthropic.com":"Technology",
-    "openai.com":"Technology","chatgpt.com":"Technology",
-    "mistral.ai":"Technology","huggingface.co":"Technology",
-    "vercel.com":"Technology","supabase.com":"Technology",
-    "figma.com":"Technology","linear.app":"Technology",
-    "cloudflare.com":"Technology","digitalocean.com":"Technology",
-    "render.com":"Technology","netlify.com":"Technology",
-    "heroku.com":"Technology","aws.amazon.com":"Technology",
-    "azure.microsoft.com":"Technology",
-    # News
-    "ndtv.com":"News","thehindu.com":"News","hindustantimes.com":"News",
-    "timesofindia.indiatimes.com":"News","indianexpress.com":"News",
-    "scroll.in":"News","thewire.in":"News","theprint.in":"News",
-    "bbc.com":"News","bbc.co.uk":"News","reuters.com":"News",
-    "apnews.com":"News","theguardian.com":"News",
-    "aajtak.in":"News","zeenews.india.com":"News","news18.com":"News",
-    "abplive.com":"News","tv9bharatvarsh.com":"News",
-    "twitter.com":"News","x.com":"News","facebook.com":"News",
-    "reddit.com":"News",
-    # Business
-    "moneycontrol.com":"Business","economictimes.indiatimes.com":"Business",
-    "livemint.com":"Business","business-standard.com":"Business",
-    "zerodha.com":"Business","groww.in":"Business","upstox.com":"Business",
-    "amazon.in":"Business","flipkart.com":"Business","snapdeal.com":"Business",
-    "razorpay.com":"Business","paytm.com":"Business",
-    "phonepe.com":"Business","indiamart.com":"Business",
-    "zoho.com":"Business","freshworks.com":"Business",
-    "amazon.com":"Business","ebay.com":"Business",
-    "meesho.com":"Business","myntra.com":"Business","ajio.com":"Business",
-    "nykaa.com":"Business","linkedin.com":"Business",
-    "shopify.com":"Business","stripe.com":"Business",
-    "linkedin.com": "Business",
-    "bloomberg.com": "Business",
-    "forbes.com": "Business",
-    "businessinsider.com": "Business",
-    "entrepreneur.com": "Business",
-    "hbr.org": "Business",
-    "crunchbase.com": "Business",
-    "glassdoor.com": "Business",
-    "indeed.com": "Business",
-    "upwork.com": "Business",
-    "fiverr.com": "Business",
-    "shopify.com": "Business",
-    # Technology
-    "github.com":"Technology","stackoverflow.com":"Technology",
-    "geeksforgeeks.org":"Technology","hackerrank.com":"Technology",
-    "leetcode.com":"Technology","codechef.com":"Technology",
-    "codeforces.com":"Technology","digit.in":"Technology",
-    "gadgets360.com":"Technology","91mobiles.com":"Technology",
-    "beebom.com":"Technology","techcrunch.com":"Technology",
-    "theverge.com":"Technology","wired.com":"Technology",
-    "arstechnica.com":"Technology","dev.to":"Technology",
-    "medium.com":"Technology","producthunt.com":"Technology",
-    "npmjs.com":"Technology","pypi.org":"Technology",
-    # Education
-    "byjus.com":"Education","unacademy.com":"Education",
-    "vedantu.com":"Education","coursera.org":"Education",
-    "khanacademy.org":"Education","nptel.ac.in":"Education",
-    "swayam.gov.in":"Education","wikipedia.org":"Education",
-    "doubtnut.com":"Education","testbook.com":"Education",
-    "udemy.com":"Education","edx.org":"Education",
-    "britannica.com":"Education","collegedunia.com":"Education",
-    "shiksha.com":"Education","careers360.com":"Education",
-    "khanacademy.org": "Education",
-    "coursera.org": "Education",
-    "edx.org": "Education",
-    "udemy.com": "Education",
-    "nptel.ac.in": "Education",
-    "brilliant.org": "Education",
-    "duolingo.com": "Education",
-    "quizlet.com": "Education",
-    "wolframalpha.com": "Education",
-    "britannica.com": "Education",
-    "wikipedia.org": "Education",
-    "scholar.google.com": "Education",
-    # Health
-    "practo.com":"Health","1mg.com":"Health","netmeds.com":"Health",
-    "apollohospitals.com":"Health","webmd.com":"Health",
-    "healthline.com":"Health","pharmeasy.in":"Health",
-    "cult.fit":"Health","medscape.com":"Health",
-    "mayoclinic.org":"Health","nih.gov":"Health",
-    "webmd.com": "Health",
-    "healthline.com": "Health",
-    "mayoclinic.org": "Health",
-    "medlineplus.gov": "Health",
-    "nih.gov": "Health",
-    "who.int": "Health",
-    "medscape.com": "Health",
-    "practo.com": "Health",
-    "1mg.com": "Health",
-    "netmeds.com": "Health"
-    # Gaming
-    "dream11.com":"Gaming","mpl.live":"Gaming","winzo.com":"Gaming",
-    "zupee.com":"Gaming","rummycircle.com":"Gaming","adda52.com":"Gaming",
-    "twitch.tv":"Gaming","ign.com":"Gaming","gamespot.com":"Gaming",
-    "steampowered.com":"Gaming","epicgames.com":"Gaming",
-    "xbox.com":"Gaming","playstation.com":"Gaming",
-    # Recreation
-    "cricbuzz.com":"Recreation","espncricinfo.com":"Recreation",
-    "sportskeeda.com":"Recreation","indiahikes.com":"Recreation",
-    "bcci.tv":"Recreation","iplt20.com":"Recreation",
-    "espn.com":"Recreation","bleacherreport.com":"Recreation",
-    "fifa.com":"Recreation","olympics.com":"Recreation",
-    "tripadvisor.com": "Recreation",
-    "booking.com": "Recreation",
-    "airbnb.com": "Recreation",
-    "rei.com": "Recreation",
-    "alltrails.com": "Recreation",
-    "strava.com": "Recreation",
-    "espn.com": "Recreation",
-    "cricbuzz.com": "Recreation",
-    "espncricinfo.com": "Recreation",
-    "fifa.com": "Recreation",
-    "icc-cricket.com": "Recreation",
-    # Lifestyle
-    "zomato.com":"Lifestyle","swiggy.com":"Lifestyle",
-    "makemytrip.com":"Lifestyle","irctc.co.in":"Lifestyle",
-    "vogue.in":"Lifestyle","femina.in":"Lifestyle",
-    "mensxp.com":"Lifestyle","shaadi.com":"Lifestyle",
-    "instagram.com":"Lifestyle","pinterest.com":"Lifestyle",
-    "tripadvisor.com":"Lifestyle","booking.com":"Lifestyle",
-    "airbnb.com":"Lifestyle","uber.com":"Lifestyle",
-    "buzzfeed.com": "Lifestyle",
-    "cosmopolitan.com": "Lifestyle",
-    "vogue.com": "Lifestyle",
-    "elle.com": "Lifestyle",
-    "allrecipes.com": "Lifestyle",
-    "food.com": "Lifestyle",
-    "tasty.co": "Lifestyle",
+    # ── Adult ─────────────────────────────────────────────────────────────────
+    "xvideos.com":          "Adult",
+    "xnxx.com":             "Adult",
+    "pornhub.com":          "Adult",
+    "xhamster.com":         "Adult",
+    "redtube.com":          "Adult",
+    "youporn.com":          "Adult",
+    "tube8.com":            "Adult",
+    "brazzers.com":         "Adult",
+    "onlyfans.com":         "Adult",
+    "chaturbate.com":       "Adult",
+    "stripchat.com":        "Adult",
+    "livejasmin.com":       "Adult",
+    "myfreecams.com":       "Adult",
+    "bongacams.com":        "Adult",
+    "nhentai.net":          "Adult",
+    "hentai2read.com":      "Adult",
+    "imbesharam.com":       "Adult",
+    "desixnxx.net":         "Adult",
+    "indianpornvideos.net": "Adult",
+    "desimasala.co":        "Adult",
+    # ── Arts ──────────────────────────────────────────────────────────────────
+    "gaana.com":            "Arts",
+    "saavn.com":            "Arts",
+    "jiosaavn.com":         "Arts",
+    "filmfare.com":         "Arts",
+    "bollywoodhungama.com": "Arts",
+    "pratilipi.com":        "Arts",
+    "rekhta.org":           "Arts",
+    "bookmyshow.com":       "Arts",
+    "youtube.com":          "Arts",
+    "youtu.be":             "Arts",
+    "netflix.com":          "Arts",
+    "primevideo.com":       "Arts",
+    "hotstar.com":          "Arts",
+    "disneyplus.com":       "Arts",
+    "zee5.com":             "Arts",
+    "sonyliv.com":          "Arts",
+    "voot.com":             "Arts",
+    "spotify.com":          "Arts",
+    "imdb.com":             "Arts",
+    "rottentomatoes.com":   "Arts",
+    "deviantart.com":       "Arts",
+    "behance.net":          "Arts",
+    "dribbble.com":         "Arts",
+    "artstation.com":       "Arts",
+    "unsplash.com":         "Arts",
+    "flickr.com":           "Arts",
+    "500px.com":            "Arts",
+    "vimeo.com":            "Arts",
+    "soundcloud.com":       "Arts",
+    "bandcamp.com":         "Arts",
+    # ── Business ──────────────────────────────────────────────────────────────
+    "moneycontrol.com":             "Business",
+    "economictimes.indiatimes.com": "Business",
+    "livemint.com":                 "Business",
+    "business-standard.com":        "Business",
+    "zerodha.com":                  "Business",
+    "groww.in":                     "Business",
+    "upstox.com":                   "Business",
+    "amazon.in":                    "Business",
+    "flipkart.com":                 "Business",
+    "snapdeal.com":                 "Business",
+    "razorpay.com":                 "Business",
+    "paytm.com":                    "Business",
+    "phonepe.com":                  "Business",
+    "indiamart.com":                "Business",
+    "zoho.com":                     "Business",
+    "freshworks.com":               "Business",
+    "amazon.com":                   "Business",
+    "ebay.com":                     "Business",
+    "meesho.com":                   "Business",
+    "myntra.com":                   "Business",
+    "ajio.com":                     "Business",
+    "nykaa.com":                    "Business",
+    "linkedin.com":                 "Business",
+    "bloomberg.com":                "Business",
+    "forbes.com":                   "Business",
+    "businessinsider.com":          "Business",
+    "entrepreneur.com":             "Business",
+    "hbr.org":                      "Business",
+    "crunchbase.com":               "Business",
+    "glassdoor.com":                "Business",
+    "indeed.com":                   "Business",
+    "upwork.com":                   "Business",
+    "fiverr.com":                   "Business",
+    "shopify.com":                  "Business",
+    "stripe.com":                   "Business",
+    # ── Education ─────────────────────────────────────────────────────────────
+    "byjus.com":            "Education",
+    "unacademy.com":        "Education",
+    "vedantu.com":          "Education",
+    "coursera.org":         "Education",
+    "khanacademy.org":      "Education",
+    "nptel.ac.in":          "Education",
+    "swayam.gov.in":        "Education",
+    "wikipedia.org":        "Education",
+    "doubtnut.com":         "Education",
+    "testbook.com":         "Education",
+    "udemy.com":            "Education",
+    "edx.org":              "Education",
+    "britannica.com":       "Education",
+    "collegedunia.com":     "Education",
+    "shiksha.com":          "Education",
+    "careers360.com":       "Education",
+    "brilliant.org":        "Education",
+    "duolingo.com":         "Education",
+    "quizlet.com":          "Education",
+    "wolframalpha.com":     "Education",
+    "scholar.google.com":   "Education",
+    # ── Gaming ────────────────────────────────────────────────────────────────
+    "dream11.com":          "Gaming",
+    "mpl.live":             "Gaming",
+    "winzo.com":            "Gaming",
+    "zupee.com":            "Gaming",
+    "rummycircle.com":      "Gaming",
+    "adda52.com":           "Gaming",
+    "twitch.tv":            "Gaming",
+    "ign.com":              "Gaming",
+    "gamespot.com":         "Gaming",
+    "steampowered.com":     "Gaming",
+    "epicgames.com":        "Gaming",
+    "xbox.com":             "Gaming",
+    "playstation.com":      "Gaming",
+    "poki.com":             "Gaming",
+    "miniclip.com":         "Gaming",
+    "kongregate.com":       "Gaming",
+    "newgrounds.com":       "Gaming",
+    "itch.io":              "Gaming",
+    "roblox.com":           "Gaming",
+    "chess.com":            "Gaming",
+    "friv.com":             "Gaming",
+    "coolmathgames.com":    "Gaming",
+    "y8.com":               "Gaming",
+    "addictinggames.com":   "Gaming",
+    # ── Health ────────────────────────────────────────────────────────────────
+    "practo.com":           "Health",
+    "1mg.com":              "Health",
+    "netmeds.com":          "Health",
+    "apollohospitals.com":  "Health",
+    "pharmeasy.in":         "Health",
+    "cult.fit":             "Health",
+    "webmd.com":            "Health",
+    "healthline.com":       "Health",
+    "mayoclinic.org":       "Health",
+    "medlineplus.gov":      "Health",
+    "nih.gov":              "Health",
+    "who.int":              "Health",
+    "medscape.com":         "Health",
+    # ── Kids ──────────────────────────────────────────────────────────────────
+    "firstcry.com":         "Kids",
+    "nickelodeonindia.com": "Kids",
+    "tinkle.in":            "Kids",
+    "amarchitrakatha.com":  "Kids",
+    "disneyindia.in":       "Kids",
+    "pbs.org":              "Kids",
+    "starfall.com":         "Kids",
+    "pbskids.org":          "Kids",
+    "nickjr.com":           "Kids",
+    "cartoonnetwork.com":   "Kids",
+    "disney.com":           "Kids",
+    "funbrain.com":         "Kids",
+    "abcmouse.com":         "Kids",
+    "sesamestreet.org":     "Kids",
+    "natgeokids.com":       "Kids",
+    # ── Lifestyle ─────────────────────────────────────────────────────────────
+    "zomato.com":           "Lifestyle",
+    "swiggy.com":           "Lifestyle",
+    "makemytrip.com":       "Lifestyle",
+    "irctc.co.in":          "Lifestyle",
+    "vogue.in":             "Lifestyle",
+    "femina.in":            "Lifestyle",
+    "mensxp.com":           "Lifestyle",
+    "shaadi.com":           "Lifestyle",
+    "instagram.com":        "Lifestyle",
+    "pinterest.com":        "Lifestyle",
+    "uber.com":             "Lifestyle",
+    "buzzfeed.com":         "Lifestyle",
+    "cosmopolitan.com":     "Lifestyle",
+    "vogue.com":            "Lifestyle",
+    "elle.com":             "Lifestyle",
+    "allrecipes.com":       "Lifestyle",
+    "food.com":             "Lifestyle",
+    "tasty.co":             "Lifestyle",
     "goodhousekeeping.com": "Lifestyle",
-    "realsimple.com": "Lifestyle",
-    "mindbodygreen.com": "Lifestyle",
-    # Kids
-    "firstcry.com":"Kids","nickelodeonindia.com":"Kids",
-    "tinkle.in":"Kids","amarchitrakatha.com":"Kids",
-    "disneyindia.in":"Kids","pbs.org":"Kids","starfall.com":"Kids",
-    "pbskids.org": "Kids",
-    "nickjr.com": "Kids",
-    "cartoonnetwork.com": "Kids",
-    "disney.com": "Kids",
-    "starfall.com": "Kids",
-    "funbrain.com": "Kids",
-    "abcmouse.com": "Kids",
-    "sesamestreet.org": "Kids",
-    "natgeokids.com": "Kids",
-    # Arts
-    "gaana.com":"Arts","saavn.com":"Arts","jiosavan.com":"Arts",
-    "filmfare.com":"Arts","bollywoodhungama.com":"Arts",
-    "pratilipi.com":"Arts","rekhta.org":"Arts","bookmyshow.com":"Arts",
-    "youtube.com":"Arts","youtu.be":"Arts","netflix.com":"Arts",
-    "primevideo.com":"Arts","hotstar.com":"Arts",
-    "disneyplus.com":"Arts","zee5.com":"Arts",
-    "sonyliv.com":"Arts","voot.com":"Arts","spotify.com":"Arts",
-    "imdb.com":"Arts","rottentomatoes.com":"Arts",
-    "deviantart.com": "Arts",
-    "behance.net": "Arts",
-    "dribbble.com": "Arts",
-    "artstation.com": "Arts",
-    "pinterest.com": "Arts",
-    "unsplash.com": "Arts",
-    "flickr.com": "Arts",
-    "500px.com": "Arts",
-    "vimeo.com": "Arts",
-    "soundcloud.com": "Arts",
-    "bandcamp.com": "Arts",
-    #gaming
-    "poki.com": "Gaming",
-    "miniclip.com": "Gaming",
-    "kongregate.com": "Gaming",
-    "newgrounds.com": "Gaming",
-    "steampowered.com": "Gaming",
-    "itch.io": "Gaming",
-    "epicgames.com": "Gaming",
-    "roblox.com": "Gaming",
-    "chess.com": "Gaming",
-    "friv.com": "Gaming",
-    "coolmathgames.com": "Gaming",
-    "y8.com": "Gaming",
-    "addictinggames.com": "Gaming",
-    "armor games.com": "Gaming",
+    "realsimple.com":       "Lifestyle",
+    "mindbodygreen.com":    "Lifestyle",
+    # ── News ──────────────────────────────────────────────────────────────────
+    "ndtv.com":                       "News",
+    "thehindu.com":                   "News",
+    "hindustantimes.com":             "News",
+    "timesofindia.indiatimes.com":    "News",
+    "indianexpress.com":              "News",
+    "scroll.in":                      "News",
+    "thewire.in":                     "News",
+    "theprint.in":                    "News",
+    "bbc.com":                        "News",
+    "bbc.co.uk":                      "News",
+    "reuters.com":                    "News",
+    "apnews.com":                     "News",
+    "theguardian.com":                "News",
+    "aajtak.in":                      "News",
+    "zeenews.india.com":              "News",
+    "news18.com":                     "News",
+    "abplive.com":                    "News",
+    "tv9bharatvarsh.com":             "News",
+    "twitter.com":                    "News",
+    "x.com":                          "News",
+    "facebook.com":                   "News",
+    "reddit.com":                     "News",
+    # ── Recreation ────────────────────────────────────────────────────────────
+    "cricbuzz.com":         "Recreation",
+    "espncricinfo.com":     "Recreation",
+    "sportskeeda.com":      "Recreation",
+    "indiahikes.com":       "Recreation",
+    "bcci.tv":              "Recreation",
+    "iplt20.com":           "Recreation",
+    "espn.com":             "Recreation",
+    "bleacherreport.com":   "Recreation",
+    "fifa.com":             "Recreation",
+    "olympics.com":         "Recreation",
+    "icc-cricket.com":      "Recreation",
+    "tripadvisor.com":      "Recreation",
+    "booking.com":          "Recreation",
+    "airbnb.com":           "Recreation",
+    "rei.com":              "Recreation",
+    "alltrails.com":        "Recreation",
+    "strava.com":           "Recreation",
+    # ── Technology ────────────────────────────────────────────────────────────
+    "claude.ai":            "Technology",
+    "anthropic.com":        "Technology",
+    "openai.com":           "Technology",
+    "chatgpt.com":          "Technology",
+    "mistral.ai":           "Technology",
+    "huggingface.co":       "Technology",
+    "vercel.com":           "Technology",
+    "supabase.com":         "Technology",
+    "figma.com":            "Technology",
+    "linear.app":           "Technology",
+    "cloudflare.com":       "Technology",
+    "digitalocean.com":     "Technology",
+    "render.com":           "Technology",
+    "netlify.com":          "Technology",
+    "heroku.com":           "Technology",
+    "aws.amazon.com":       "Technology",
+    "azure.microsoft.com":  "Technology",
+    "github.com":           "Technology",
+    "stackoverflow.com":    "Technology",
+    "geeksforgeeks.org":    "Technology",
+    "hackerrank.com":       "Technology",
+    "leetcode.com":         "Technology",
+    "codechef.com":         "Technology",
+    "codeforces.com":       "Technology",
+    "digit.in":             "Technology",
+    "gadgets360.com":       "Technology",
+    "91mobiles.com":        "Technology",
+    "beebom.com":           "Technology",
+    "techcrunch.com":       "Technology",
+    "theverge.com":         "Technology",
+    "wired.com":            "Technology",
+    "arstechnica.com":      "Technology",
+    "dev.to":               "Technology",
+    "medium.com":           "Technology",
+    "producthunt.com":      "Technology",
+    "npmjs.com":            "Technology",
+    "pypi.org":             "Technology",
 }
 
 
@@ -743,9 +806,7 @@ def build_weighted_features(scraped: dict, url: str) -> str:
         meta  = scraped.get("meta_description", "").strip()
         h1    = scraped.get("h1", "").strip()
         h2    = scraped.get("h2", "").strip()
-        body  = scraped.get("body_text", "").strip()
-        if not title and not body and "text" in scraped:
-            body = scraped.get("text", "")
+        body  = scraped.get("body", scraped.get("body_text", "")).strip()
         url_feat = extract_url_features(url)
         if title:    parts += [title] * 4
         if meta:     parts += [meta]  * 3
@@ -799,23 +860,20 @@ async def smart_classify(url: str) -> tuple:
         features = build_weighted_features(scraped, url)
         method   = "combined_features"
 
-    # Last resort: if still no features, use raw domain as input
     if not features.strip():
         features = domain.replace(".", " ").replace("-", " ")
         method   = "domain_name_only"
 
-    # If truly nothing, return a generic result rather than raising 422
     if not features.strip():
         return "Technology", 30.0, [{"category": "Technology", "confidence": 30.0}], "fallback"
 
     try:
         category, confidence, top3 = await run_prediction(features)
     except HTTPException as he:
-        # HF Space is down/cold — return graceful fallback
         print(f"[HF ERROR in smart_classify] {he.detail}")
         return "Technology", 30.0, [{"category": "Technology", "confidence": 30.0}], "hf_error_fallback"
 
-    # 1. First fallback: Try parsing just the URL structure if the combined features failed
+    # Fallback 1: try URL features alone if confidence is low
     if confidence < CONFIDENCE_THRESHOLD and method == "combined_features":
         url_features = extract_url_features(url)
         if url_features.strip():
@@ -825,25 +883,26 @@ async def smart_classify(url: str) -> tuple:
                     category, confidence, top3 = cat_url, conf_url, top3_url
                     method = "url_features_fallback"
             except Exception:
-                pass  # keep original result
+                pass
 
-    # 2. Second fallback: If STILL below threshold, use your custom keyword rules
+    # Fallback 2: keyword rules if still below threshold
+    # FIX v2.7.0: was referencing undefined `extracted_text`, now correctly uses `features`
     if confidence < CONFIDENCE_THRESHOLD:
-        fallback_cat, fallback_conf = keyword_fallback(extracted_text)
+        fallback_cat, fallback_conf = keyword_fallback(features)
         if fallback_cat and fallback_conf >= 30.0:
-            category = fallback_cat
+            category   = fallback_cat
             confidence = fallback_conf
-            method = "keyword_fallback"
+            method     = "keyword_fallback"
         else:
-            # If keywords didn't cross 30%, keep the best model guess but tag it
             if method != "url_features_fallback":
                 method = "model_low_confidence"
     else:
-        # If it was high confidence from the start and didn't use the URL fallback
         if method != "url_features_fallback":
             method = "model"
 
     return category, confidence, top3, method
+
+
 # ─────────────────────────────────────────────
 # SCHEMAS
 # ─────────────────────────────────────────────
@@ -871,34 +930,36 @@ class PredictionResult(BaseModel):
 @app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
 async def root(request: Request):
     return {
-        "message"     : "Website Category Classifier API v2.6.0",
+        "message"     : "Website Category Classifier API v2.7.0",
         "architecture": "HF Space Relay (Render RAM: ~80 MB)",
+        "model"       : "DistilBERT retrained June 2026 — 85.4% test accuracy",
         "classes"     : CLASS_NAMES,
         "docs"        : "/docs",
     }
 
 @app.api_route("/ping", methods=["GET", "HEAD"], tags=["Info"])
 async def ping(request: Request):
-    return {"status": "alive", "version": "2.6.0"}
+    return {"status": "alive", "version": "2.7.0"}
 
 @app.api_route("/health", methods=["GET", "HEAD"], tags=["Info"])
 async def health(request: Request):
     return {
-        "status"       : "ok",
-        "version"      : "2.6.0",
-        "architecture" : "hf_space_relay",
-        "hf_space"     : HF_SPACE_URL,
-        "hf_model"     : HF_MODEL_ID,
-        "classes"      : CLASS_NAMES,
-        "cache_size"   : len(_prediction_cache),
-        "cache_max"    : MAX_CACHE_SIZE,
+        "status"        : "ok",
+        "version"       : "2.7.0",
+        "architecture"  : "hf_space_relay",
+        "hf_space"      : HF_SPACE_URL,
+        "hf_model"      : HF_MODEL_ID,
+        "model_accuracy": "85.4% test | 91.8% val",
+        "classes"       : CLASS_NAMES,
+        "cache_size"    : len(_prediction_cache),
+        "cache_max"     : MAX_CACHE_SIZE,
     }
 
 @app.get("/usage", tags=["Info"])
 async def usage_info():
     return {
         "name":       "Website Category Classifier",
-        "version":    "2.6.0",
+        "version":    "2.7.0",
         "categories": CLASS_NAMES,
         "endpoints": {
             "POST /classify/url":   "Classify a live website by URL",
@@ -921,7 +982,6 @@ async def usage_info():
 async def classify_url(request: Request, body: URLRequest):
     start = time.time()
     ip    = get_ip(request)
-    
     try:
         url = body.url.strip()
         if not is_valid_url(url):
@@ -940,7 +1000,6 @@ async def classify_url(request: Request, body: URLRequest):
     except Exception as e:
         log_request(ip, "/classify/url", False, 0, input_url=body.url)
         raise HTTPException(500, f"Internal error: {str(e)}")
-    
 
 
 # ── 2. POST /classify/text ────────────────────
@@ -986,8 +1045,10 @@ async def classify_batch(request: Request, body: BatchURLRequest):
             try:
                 category, confidence, _, method = await smart_classify(url)
                 results.append({
-                    "url": url, "category": category,
-                    "confidence": confidence, "method": method,
+                    "url":        url,
+                    "category":   category,
+                    "confidence": confidence,
+                    "method":     method,
                     "safe":       category not in ADULT_CATEGORIES,
                     "adult_flag": category in ADULT_CATEGORIES,
                 })
@@ -1006,8 +1067,10 @@ async def classify_batch(request: Request, body: BatchURLRequest):
                 f"{r['method']},{r['safe']},{r['adult_flag']}"
             )
         return {
-            "total": len(results), "time_ms": elapsed,
-            "results": results, "csv_export": "\n".join(csv_lines),
+            "total":      len(results),
+            "time_ms":    elapsed,
+            "results":    results,
+            "csv_export": "\n".join(csv_lines),
         }
     except HTTPException:
         raise
@@ -1041,10 +1104,16 @@ async def safe_check(request: Request, body: URLRequest):
                     input_url=url, category=category,
                     confidence=confidence, method=method)
         return {
-            "url": url, "category": category, "confidence": confidence,
-            "safe": not adult_flag, "adult_flag": adult_flag,
-            "kids_safe": kids_safe, "safe_for_kids": safe_for_kids,
-            "verdict": verdict, "method": method, "time_ms": elapsed,
+            "url":          url,
+            "category":     category,
+            "confidence":   confidence,
+            "safe":         not adult_flag,
+            "adult_flag":   adult_flag,
+            "kids_safe":    kids_safe,
+            "safe_for_kids":safe_for_kids,
+            "verdict":      verdict,
+            "method":       method,
+            "time_ms":      elapsed,
         }
     except HTTPException:
         raise
@@ -1057,8 +1126,8 @@ async def safe_check(request: Request, body: URLRequest):
 @app.api_route("/explain", methods=["GET", "POST"], tags=["XAI"])
 async def explain(request: Request):
     return JSONResponse(status_code=503, content={
-        "error"      : "LIME explanation unavailable in HF Space relay mode.",
-        "workaround" : "Use top3 from /classify/url for the top 3 category scores.",
+        "error"     : "LIME explanation unavailable in HF Space relay mode.",
+        "workaround": "Use top3 from /classify/url for the top 3 category scores.",
     })
 
 
@@ -1108,9 +1177,9 @@ async def get_stats(
             ],
             "recent_requests": [
                 {
-                    "timestamp": r[0], "ip": r[1], "endpoint": r[2],
+                    "timestamp": r[0], "ip":       r[1], "endpoint":   r[2],
                     "input_url": r[3], "category": r[4], "confidence": r[5],
-                    "success": bool(r[6]), "time_ms": r[7], "method": r[8],
+                    "success":   bool(r[6]), "time_ms": r[7], "method": r[8],
                 }
                 for r in recent
             ],

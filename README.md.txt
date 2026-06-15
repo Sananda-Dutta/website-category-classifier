@@ -41,3 +41,7 @@ http://127.0.0.1:8000/docs
 ## Model
 
 Hosted on HuggingFace Hub.
+
+## Accuracy
+
+85.4%
