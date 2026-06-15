@@ -2,7 +2,7 @@
 # auth.py — API credential verification
 # Website Category Classifier  v2.7.0
 #
-# NOTE: Primary auth is handled in main.py via the RAPIDAPI_PROXY_SECRET
+# NOTE: Primary auth is handled in api.py via the RAPIDAPI_PROXY_SECRET
 # middleware (X-RapidAPI-Proxy-Secret header check).
 #
 # This module exists for optional secondary credential checks —
