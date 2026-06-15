@@ -38,7 +38,7 @@ import re
 import sqlite3
 import time
 
-from auth import verify_api_credentials
+from .auth import verify_api_credentials
 
 from contextlib import asynccontextmanager
 from datetime import datetime
