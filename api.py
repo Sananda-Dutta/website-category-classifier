@@ -404,22 +404,42 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# ── RapidAPI proxy secret ─────────────────────
 RAPIDAPI_SECRET = os.getenv("RAPIDAPI_PROXY_SECRET", "").strip()
+DIRECT_API_KEY  = os.getenv("DIRECT_API_KEY", "").strip()
 
 @app.middleware("http")
 async def verify_rapidapi_proxy(request: Request, call_next):
     skip_paths = {"/health", "/docs", "/openapi.json", "/redoc",
                   "/", "/ping", "/usage"}
-    if RAPIDAPI_SECRET and request.url.path not in skip_paths:
-        incoming = request.headers.get("X-RapidAPI-Proxy-Secret", "").strip()
-        print(f"[AUTH] path={request.url.path} incoming={repr(incoming)} "
-              f"expected={repr(RAPIDAPI_SECRET)} match={incoming == RAPIDAPI_SECRET}")
-        if incoming != RAPIDAPI_SECRET:
-            return JSONResponse(status_code=403, content={
-                "error": "Access via RapidAPI only. Sign up at rapidapi.com"
-            })
-    return await call_next(request)
+
+    # Always allow skipped paths
+    if request.url.path in skip_paths:
+        return await call_next(request)
+
+    # No secrets configured at all → open access
+    if not RAPIDAPI_SECRET and not DIRECT_API_KEY:
+        return await call_next(request)
+
+    incoming_proxy  = request.headers.get("X-RapidAPI-Proxy-Secret", "").strip()
+    incoming_direct = request.headers.get("X-API-Key", "").strip()
+
+    # ✅ RapidAPI traffic
+    if incoming_proxy and incoming_proxy == RAPIDAPI_SECRET:
+        return await call_next(request)
+
+    # ✅ Direct/testing traffic
+    if incoming_direct and incoming_direct == DIRECT_API_KEY:
+        return await call_next(request)
+
+    # ❌ Neither matched
+    print(f"[AUTH] BLOCKED path={request.url.path} "
+          f"proxy={repr(incoming_proxy)} direct={repr(incoming_direct)}")
+    return JSONResponse(status_code=403, content={
+        "error": "Access denied.",
+        "hint": "Use X-RapidAPI-Proxy-Secret for RapidAPI traffic, "
+                "or X-API-Key for direct access."
+    })
+
 
 app.add_middleware(
     CORSMiddleware,
