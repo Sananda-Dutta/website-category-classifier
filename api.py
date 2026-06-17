@@ -392,7 +392,7 @@ app = FastAPI(
     title="Website Category Classifier API",
     description=(
         "Classify any website into 11 categories using DistilBERT.\n\n"
-        "**Model accuracy: 85.4% test | 91.8% val** (retrained June 2026)\n\n"
+        "**Model accuracy: 82.2% test | 91.8% val** (retrained June 2026)\n\n"
         "**Categories:** Adult · Arts · Business · Education · Gaming · "
         "Health · Kids · Lifestyle · News · Recreation · Technology\n\n"
         "Built by **SanandaDutta** — "

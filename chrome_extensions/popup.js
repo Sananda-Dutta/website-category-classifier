@@ -202,11 +202,20 @@ async function classifyUrl(originalUrl) {
 
     $("result-emoji").textContent    = CATEGORY_EMOJI[category] || "🌐";
     $("result-category").textContent = category;
-    $("badge-conf").textContent      = `${confidence}% confidence`;
     $("badge-time").textContent      = `${timeMs} ms`;
-    $("method-badge").textContent    = method === "domain_shortcut"
-      ? "Domain shortcut" : "DistilBERT";
 
+    if (method === "combined_features" || method === "domain_shortcut" || method === "path_shortcut") {
+        $("badge-conf").textContent   = `${confidence}% confidence`;
+        $("method-badge").textContent = method === "domain_shortcut" ? "Domain shortcut" : "DistilBERT";
+        $("method-badge").style.backgroundColor = "#28a745"; 
+        $("method-badge").style.color = "#fff";
+    } else {
+        $("badge-conf").textContent   = "Low-Confidence Guess";
+        $("method-badge").textContent = "Limited Content Fallback";
+        $("method-badge").style.backgroundColor = "#ffc107"; 
+        $("method-badge").style.color = "#000";             
+    }
+    // ===========================================================================
     renderVerdict(safeData);
     renderTop3(classData?.top3 || [{ category, confidence }]);
 

@@ -53,7 +53,7 @@ def scrape_website(url):
         response.raise_for_status()
 
         # Handle bot-blocking / empty responses
-        if not response.text or len(response.text) < 200:
+        if not response.text or (len(response.text) < 800 and len(response.text) > 500):
             return {"error": "Empty or blocked response"}
 
     except requests.exceptions.Timeout:
@@ -71,6 +71,30 @@ def scrape_website(url):
     title = ""
     if soup.title and soup.title.string:
         title = soup.title.string.strip()
+    
+    # Body text raw capture (We fetch this up here now so we can use it for the bot check)
+    body_text = soup.get_text(separator=" ", strip=True)
+
+    # =====================================================================
+    # 🔥 NEW CODE ADDEED HERE: BOT CHALLENGE INTERCEPTION
+    # =====================================================================
+    check_payload = f"{title} {body_text}".lower()
+    bot_signatures = [
+        "checking your browser", 
+        "enable javascript", 
+        "are you human", 
+        "access denied", 
+        "cloudflare",
+        "captcha"
+    ]
+    if any(sig in check_payload for sig in bot_signatures):
+        return {
+            "url": url,
+            "title": "", "meta_description": "",
+            "meta_keywords": "", "h1": "", "h2": "", "body": "",
+            "error": "BOT_CHALLENGE"
+        }
+    # =====================================================================
 
     # Meta description
     meta_desc = ""
