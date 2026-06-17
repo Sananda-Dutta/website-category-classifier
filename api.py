@@ -1,4 +1,4 @@
-# ═══════════════════════════════════════════════════════════════════════════════
+F# ═══════════════════════════════════════════════════════════════════════════════
 # Website Category Classifier API  —  v2.7.0
 # Model   : DistilBERT fine-tuned (11 categories)
 # Author  : SanandaDutta
@@ -875,9 +875,15 @@ async def smart_classify(url: str) -> tuple:
     if not features.strip():
         features = domain.replace(".", " ").replace("-", " ")
         method   = "domain_name_only"
-
-    if not features.strip():
-        return "Technology", 30.0, [{"category": "Technology", "confidence": 30.0}], "fallback"
+    
+    if not features.strip() or len(features.split()) < 15:
+        # Returning a tuple to perfectly match your existing smart_classify structure:
+        return (
+            "Unknown", 
+            0.0, 
+            [{"category": "Unknown", "confidence": 0.0}], 
+            "unable_to_extract_fallback"
+        )
 
     try:
         category, confidence, top3 = await run_prediction(features)
