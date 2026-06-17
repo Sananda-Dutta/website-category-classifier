@@ -5,12 +5,11 @@
 # HF Repo : SanandaDutta/website-category-distilbert
 #
 # v2.7.0 — Model retrained on verified Indian + global URLs
-#           Test accuracy: 85.4% | Val accuracy: 91.8% (June 2026)
+#           Test accuracy: 82.2% | Val accuracy: 91.8% (June 2026)
 #
 # CHANGES FROM v2.6.0:
 #   - Model retrained on clean verified data (no DMOZ noise)
 #   - Fixed: keyword_fallback was referencing undefined `extracted_text`
-#   - Fixed: missing comma in DOMAIN_SHORTCUTS (syntax error)
 #   - Fixed: duplicate domain keys cleaned up
 #   - Added: more Adult domain shortcuts
 #   - Version bumped to v2.7.0
@@ -404,42 +403,22 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# ── RapidAPI proxy secret ─────────────────────
 RAPIDAPI_SECRET = os.getenv("RAPIDAPI_PROXY_SECRET", "").strip()
-DIRECT_API_KEY  = os.getenv("DIRECT_API_KEY", "").strip()
 
 @app.middleware("http")
 async def verify_rapidapi_proxy(request: Request, call_next):
     skip_paths = {"/health", "/docs", "/openapi.json", "/redoc",
                   "/", "/ping", "/usage"}
-
-    # Always allow skipped paths
-    if request.url.path in skip_paths:
-        return await call_next(request)
-
-    # No secrets configured at all → open access
-    if not RAPIDAPI_SECRET and not DIRECT_API_KEY:
-        return await call_next(request)
-
-    incoming_proxy  = request.headers.get("X-RapidAPI-Proxy-Secret", "").strip()
-    incoming_direct = request.headers.get("X-API-Key", "").strip()
-
-    # ✅ RapidAPI traffic
-    if incoming_proxy and incoming_proxy == RAPIDAPI_SECRET:
-        return await call_next(request)
-
-    # ✅ Direct/testing traffic
-    if incoming_direct and incoming_direct == DIRECT_API_KEY:
-        return await call_next(request)
-
-    # ❌ Neither matched
-    print(f"[AUTH] BLOCKED path={request.url.path} "
-          f"proxy={repr(incoming_proxy)} direct={repr(incoming_direct)}")
-    return JSONResponse(status_code=403, content={
-        "error": "Access denied.",
-        "hint": "Use X-RapidAPI-Proxy-Secret for RapidAPI traffic, "
-                "or X-API-Key for direct access."
-    })
-
+    if RAPIDAPI_SECRET and request.url.path not in skip_paths:
+        incoming = request.headers.get("X-RapidAPI-Proxy-Secret", "").strip()
+        print(f"[AUTH] path={request.url.path} incoming={repr(incoming)} "
+              f"expected={repr(RAPIDAPI_SECRET)} match={incoming == RAPIDAPI_SECRET}")
+        if incoming != RAPIDAPI_SECRET:
+            return JSONResponse(status_code=403, content={
+                "error": "Access via RapidAPI only. Sign up at rapidapi.com"
+            })
+    return await call_next(request)
 
 app.add_middleware(
     CORSMiddleware,
@@ -819,32 +798,45 @@ def extract_url_features(url: str) -> str:
     except Exception:
         return ""
 
+
 def build_weighted_features(scraped: dict, url: str) -> str:
     parts = []
     try:
+        # 1. Safely pull data from your active scraper dictionary
         title = scraped.get("title", "").strip()
         meta  = scraped.get("meta_description", "").strip()
-        h1    = scraped.get("h1", "").strip()
-        h2    = scraped.get("h2", "").strip()
+        keywords = scraped.get("keywords", "").strip()
+        
+        # Pull headings and paragraph strings
+        h1_h2_h3 = scraped.get("h1_h2_h3", "").strip() or " ".join([scraped.get("h1", ""), scraped.get("h2", "")]).strip()
+        paragraphs = scraped.get("paragraphs", "").strip()
+        
+        # Read the raw background body copy block
         body  = scraped.get("body", scraped.get("body_text", "")).strip()
-        url_feat = extract_url_features(url)
-        if title:    parts += [title] * 4
-        if meta:     parts += [meta]  * 3
-        if h1:       parts += [h1]    * 2
-        if h2:       parts += [h2]    * 2
-        if body:     parts += [body[:800]]
-        if url_feat: parts += [url_feat] * 2
+        
+        # 2. Append them strictly ONE time each (NO multiplication lists!)
+        if title:      parts.append(title)
+        if meta:       parts.append(meta)
+        if keywords:   parts.append(keywords)
+        if h1_h2_h3:   parts.append(h1_h2_h3)
+        if paragraphs: parts.append(paragraphs)
+        
+        # 3. Match the 3000-character body snapshot parsing limit
+        if body:       
+            parts.append(body[:3000])
+            
     except Exception:
         return extract_url_features(url)
-    words = " ".join(parts).lower().split()
+    
+    # 4. Standardize text structure transformations (regex cleaning rules)
+    result = " ".join(parts)
+    result = re.sub(r'http\S+', '', result)   # drop links
+    result = re.sub(r'[^\w\s]', ' ', result)   # drop symbols
+    result = re.sub(r'\s+', ' ', result).strip().lower()
+    
+    # 5. Cap the total feature payload output string precisely at 1500 chars
+    words = result[:1500].split()
     return " ".join(w for w in words if w not in NOISE_WORDS and len(w) > 2)
-
-def filter_noise(text: str) -> str:
-    return " ".join(
-        w for w in text.lower().split()
-        if w not in NOISE_WORDS and len(w) > 2
-    )
-
 
 # ─────────────────────────────────────────────
 # SMART CLASSIFY

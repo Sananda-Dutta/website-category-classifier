@@ -30,7 +30,6 @@ BLOCKED_SITES = [
 def is_blocked_site(url):
     return any(site in url.lower() for site in BLOCKED_SITES)
 
-
 def scrape_website(url):
     if not url.startswith("http"):
         url = "https://" + url
@@ -53,7 +52,7 @@ def scrape_website(url):
         )
         response.raise_for_status()
 
-        # 🚨 Handle bot-blocking / empty responses
+        # Handle bot-blocking / empty responses
         if not response.text or len(response.text) < 200:
             return {"error": "Empty or blocked response"}
 
@@ -66,46 +65,54 @@ def scrape_website(url):
     except Exception as e:
         return {"error": f"Error: {str(e)}"}
 
-    soup = BeautifulSoup(response.text, "lxml")
+    soup = BeautifulSoup(response.text, "html.parser")  # Swapped to html.parser to match training exactly
 
-    # ✅ SAFE title extraction (fixes NoneType crash)
+    # Title extraction
     title = ""
     if soup.title and soup.title.string:
         title = soup.title.string.strip()
 
-    # ✅ Meta description (safe)
+    # Meta description
     meta_desc = ""
-    meta_tag = soup.find("meta", attrs={"name": "description"})
-    if meta_tag and meta_tag.get("content"):
-        meta_desc = meta_tag.get("content").strip()
+    for attr in [{"name": "description"}, {"property": "og:description"}]:
+        meta_tag = soup.find("meta", attrs=attr)
+        if meta_tag and meta_tag.get("content"):
+            meta_desc = meta_tag.get("content").strip()
+            break
 
-    # ✅ Meta keywords (safe)
+    # Meta keywords
     meta_keywords = ""
     kw_tag = soup.find("meta", attrs={"name": "keywords"})
     if kw_tag and kw_tag.get("content"):
         meta_keywords = kw_tag.get("content").strip()
 
-    # ✅ Headings (important for classification)
-    h1 = " ".join([
-        h.get_text(strip=True)
-        for h in soup.find_all("h1")
-        if h.get_text()
-    ])
+    # Headings (Updated to look for h1, h2, h3 up to 10 tags total)
+    headings_list = []
+    for tag in soup.find_all(["h1", "h2", "h3"])[:10]:
+        text = tag.get_text(strip=True)
+        if text:
+            headings_list.append(text)
+    h1 = " ".join(headings_list)
+    h2 = ""  # Keeping h2 as empty string so it doesn't break other dictionary lookups
 
-    h2 = " ".join([
-        h.get_text(strip=True)
-        for h in soup.find_all("h2")
-        if h.get_text()
-    ])
+    # --- NEW REQUIRED THING: Extract Paragraphs (<p>) ---
+    paragraphs_list = []
+    for p in soup.find_all("p")[:20]:
+        text = p.get_text(strip=True)
+        if len(text.split()) >= 4:
+            paragraphs_list.append(text)
+    paragraphs_text = " ".join(paragraphs_list)
 
-    # ✅ Remove noisy tags
+    # Remove noisy tags before grabing full body dump
     for tag in soup(["script", "style", "nav", "footer", "header", "noscript"]):
         tag.decompose()
 
-    # ✅ Body text (limit size for performance)
+    # Body text capture window adjusted to 3000 chars
     body_text = soup.get_text(separator=" ", strip=True)
-    body_words = body_text.split()[:1000]   # 🔥 increased from 500 → 1000
-    body = " ".join(body_words)
+    body = re.sub(r'\s+', ' ', body_text)[:3000]
+
+    # Mix the new paragraph text features directly into the body string for safety
+    combined_body = f"{paragraphs_text} {body}".strip()
 
     return {
         "url": url,
@@ -114,10 +121,9 @@ def scrape_website(url):
         "meta_keywords": meta_keywords,
         "h1": h1,
         "h2": h2,
-        "body": body,
+        "body": combined_body,
         "error": None
     }
-
 
 def extract_domain(url):
     try:
@@ -129,85 +135,30 @@ def extract_domain(url):
 def build_feature_string(scraped):
     parts = []
 
-    # ─────────────────────────────
-    # 1. Core content features
-    # ─────────────────────────────
-    title = scraped.get("title", "")
-    meta_desc = scraped.get("meta_description", "")
-    meta_keywords = scraped.get("meta_keywords", "")
-    h1 = scraped.get("h1", "")
-    h2 = scraped.get("h2", "")
-    body = scraped.get("body", "")[:1500]  # 🔥 increase context
+    # Pull core features
+    title = scraped.get("title", "").strip()
+    meta_desc = scraped.get("meta_description", "").strip()
+    meta_keywords = scraped.get("meta_keywords", "").strip()
+    h1 = scraped.get("h1", "").strip()
+    body = scraped.get("body", "").strip()
 
-    # ─────────────────────────────
-    # 2. Domain feature (VERY IMPORTANT)
-    # ─────────────────────────────
+    # Extract Domain string
     url = scraped.get("url", "")
     domain = extract_domain(url)
 
-    # Boost domain importance
-    parts.append(domain)
-    parts.append(domain)
+    # Stack things up EXACTLY ONE TIME (No multiplication list hacks, no artificial boosts)
+    if domain:        parts.append(domain)
+    if title:         parts.append(title)
+    if meta_desc:     parts.append(meta_desc)
+    if h1:            parts.append(h1)
+    if meta_keywords: parts.append(meta_keywords)
+    if body:          parts.append(body)
 
-    # ─────────────────────────────
-    # 3. Weighted important features
-    # ─────────────────────────────
-    parts.append(title)
-    parts.append(title)        # 🔥 boost title
+    # Standard clean up sequence
+    features = " ".join([p for p in parts if p])
+    result = re.sub(r'http\S+', '', features)
+    result = re.sub(r'[^\w\s]', ' ', result)
+    result = re.sub(r'\s+', ' ', result).strip().lower()
 
-    parts.append(meta_desc)
-
-    parts.append(h1)
-    parts.append(h1)           # 🔥 boost headings
-
-    parts.append(h2)
-
-    parts.append(meta_keywords)
-
-    # Body content (less weight but important)
-    parts.append(body)
-
-    # ─────────────────────────────
-    # 4. Combine safely
-    # ─────────────────────────────
-    features = " ".join([p for p in parts if p and p.strip()])
-    features_lower = features.lower()
-
-    # ─────────────────────────────
-    # 5. Smart keyword boosting
-    # ─────────────────────────────
-
-    # 📰 News
-    if any(x in features_lower for x in ["news", "breaking", "headline", "journal"]):
-        features += " news news news news"
-
-    # 🛒 E-commerce
-    if any(x in features_lower for x in ["shop", "buy", "cart", "product", "sale", "order"]):
-        features += " ecommerce ecommerce ecommerce ecommerce"
-
-    # 💻 Technology
-    if any(x in features_lower for x in ["tech", "software", "developer", "code", "programming", "api"]):
-        features += " technology technology technology"
-
-    # 🏥 Health
-    if any(x in features_lower for x in ["health", "doctor", "medical", "clinic", "hospital"]):
-        features += " health health"
-
-    # 🎓 Education
-    if any(x in features_lower for x in ["course", "learn", "education", "exam", "university"]):
-        features += " education education"
-
-    # ⚽ Sports
-    if any(x in features_lower for x in ["sport", "cricket", "football", "match", "score"]):
-        features += " sports sports"
-
-    # 💼 Business
-    if any(x in features_lower for x in ["business", "market", "finance", "stock", "startup"]):
-        features += " business business"
-
-    # 🏛️ Government / fallback
-    if any(x in features_lower for x in ["gov", "government", "ministry", "policy"]):
-        features += " other other"
-
-    # ─────────────────────────────
-    return features
+    # Enforce the final 1500 character window slice cap
+    return result[:1500]
