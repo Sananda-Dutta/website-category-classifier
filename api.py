@@ -1,4 +1,4 @@
-F# ═══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 # Website Category Classifier API  —  v2.7.0
 # Model   : DistilBERT fine-tuned (11 categories)
 # Author  : SanandaDutta
