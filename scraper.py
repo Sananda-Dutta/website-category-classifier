@@ -1,24 +1,18 @@
 import requests
 from bs4 import BeautifulSoup
 import re
-import random
+import os
 
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
-]
-
-def get_headers():
-    return {
-        "User-Agent": random.choice(USER_AGENTS),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-        "Accept-Encoding": "gzip, deflate, br",
-        "DNT": "1",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-    }
+# ---------------------------------------------------------------------------
+# NEW: URL of your HuggingFace scraper microservice (Playwright + stealth +
+# Browserless fallback). Set this as an environment variable on Render
+# named SCRAPER_SERVICE_URL. The hardcoded value below is just a fallback
+# default so local testing still works without setting the env var.
+# ---------------------------------------------------------------------------
+SCRAPER_SERVICE_URL = os.environ.get(
+    "SCRAPER_SERVICE_URL",
+    "https://sanandadutta-wcc-scraper.hf.space"
+)
 
 # Sites known to block scrapers — classify by URL only
 BLOCKED_SITES = [
@@ -34,7 +28,7 @@ def scrape_website(url):
     if not url.startswith("http"):
         url = "https://" + url
 
-    # Skip known blocked sites
+    # Skip known blocked sites (no point even asking the scraper service)
     if is_blocked_site(url):
         return {
             "url": url,
@@ -43,17 +37,28 @@ def scrape_website(url):
             "error": "BLOCKED"
         }
 
+    # -----------------------------------------------------------------
+    # CHANGED: instead of requests.get(url) directly, we POST the target
+    # URL to our scraper microservice, which does the actual fetching
+    # (via a real browser, so it isn't blocked by target sites the way
+    # Render's own IP would be). It hands back the full raw HTML.
+    # -----------------------------------------------------------------
     try:
-        response = requests.get(
-            url,
-            headers=get_headers(),
-            timeout=10,
-            allow_redirects=True
+        response = requests.post(
+            f"{SCRAPER_SERVICE_URL}/scrape",
+            json={"url": url},
+            timeout=30  # browser rendering takes longer than a plain GET
         )
         response.raise_for_status()
+        result = response.json()
 
-        # Handle bot-blocking / empty responses
-        if not response.text or (len(response.text) < 800 and len(response.text) > 500):
+        if not result.get("success"):
+            return {"error": result.get("error", "Scraper service failed")}
+
+        html_content = result.get("html", "")
+
+        # Handle bot-blocking / empty responses (same guard as before)
+        if not html_content or (len(html_content) < 800 and len(html_content) > 500):
             return {"error": "Empty or blocked response"}
 
     except requests.exceptions.Timeout:
@@ -65,25 +70,31 @@ def scrape_website(url):
     except Exception as e:
         return {"error": f"Error: {str(e)}"}
 
-    soup = BeautifulSoup(response.text, "html.parser")  # Swapped to html.parser to match training exactly
+    # -----------------------------------------------------------------
+    # EVERYTHING BELOW THIS LINE IS UNCHANGED from your original file.
+    # It parses html_content exactly the same way it used to parse
+    # response.text — the scraper service just gets us clean, unblocked
+    # HTML to hand to BeautifulSoup.
+    # -----------------------------------------------------------------
+    soup = BeautifulSoup(html_content, "html.parser")
 
     # Title extraction
     title = ""
     if soup.title and soup.title.string:
         title = soup.title.string.strip()
-    
-    # Body text raw capture (We fetch this up here now so we can use it for the bot check)
+
+    # Body text raw capture (used for the bot check)
     body_text = soup.get_text(separator=" ", strip=True)
 
     # =====================================================================
-    # 🔥 NEW CODE ADDEED HERE: BOT CHALLENGE INTERCEPTION
+    # BOT CHALLENGE INTERCEPTION
     # =====================================================================
     check_payload = f"{title} {body_text}".lower()
     bot_signatures = [
-        "checking your browser", 
-        "enable javascript", 
-        "are you human", 
-        "access denied", 
+        "checking your browser",
+        "enable javascript",
+        "are you human",
+        "access denied",
         "cloudflare",
         "captcha"
     ]
@@ -110,16 +121,16 @@ def scrape_website(url):
     if kw_tag and kw_tag.get("content"):
         meta_keywords = kw_tag.get("content").strip()
 
-    # Headings (Updated to look for h1, h2, h3 up to 10 tags total)
+    # Headings (h1, h2, h3 up to 10 tags total)
     headings_list = []
     for tag in soup.find_all(["h1", "h2", "h3"])[:10]:
         text = tag.get_text(strip=True)
         if text:
             headings_list.append(text)
     h1 = " ".join(headings_list)
-    h2 = ""  # Keeping h2 as empty string so it doesn't break other dictionary lookups
+    h2 = ""  # kept as empty string so it doesn't break other dictionary lookups
 
-    # --- NEW REQUIRED THING: Extract Paragraphs (<p>) ---
+    # Extract paragraphs
     paragraphs_list = []
     for p in soup.find_all("p")[:20]:
         text = p.get_text(strip=True)
@@ -127,15 +138,15 @@ def scrape_website(url):
             paragraphs_list.append(text)
     paragraphs_text = " ".join(paragraphs_list)
 
-    # Remove noisy tags before grabing full body dump
+    # Remove noisy tags before grabbing full body dump
     for tag in soup(["script", "style", "nav", "footer", "header", "noscript"]):
         tag.decompose()
 
-    # Body text capture window adjusted to 3000 chars
+    # Body text capture window (3000 chars)
     body_text = soup.get_text(separator=" ", strip=True)
     body = re.sub(r'\s+', ' ', body_text)[:3000]
 
-    # Mix the new paragraph text features directly into the body string for safety
+    # Mix the paragraph text features directly into the body string
     combined_body = f"{paragraphs_text} {body}".strip()
 
     return {
@@ -159,18 +170,15 @@ def extract_domain(url):
 def build_feature_string(scraped):
     parts = []
 
-    # Pull core features
     title = scraped.get("title", "").strip()
     meta_desc = scraped.get("meta_description", "").strip()
     meta_keywords = scraped.get("meta_keywords", "").strip()
     h1 = scraped.get("h1", "").strip()
     body = scraped.get("body", "").strip()
 
-    # Extract Domain string
     url = scraped.get("url", "")
     domain = extract_domain(url)
 
-    # Stack things up EXACTLY ONE TIME (No multiplication list hacks, no artificial boosts)
     if domain:        parts.append(domain)
     if title:         parts.append(title)
     if meta_desc:     parts.append(meta_desc)
@@ -178,11 +186,9 @@ def build_feature_string(scraped):
     if meta_keywords: parts.append(meta_keywords)
     if body:          parts.append(body)
 
-    # Standard clean up sequence
     features = " ".join([p for p in parts if p])
     result = re.sub(r'http\S+', '', features)
     result = re.sub(r'[^\w\s]', ' ', result)
     result = re.sub(r'\s+', ' ', result).strip().lower()
 
-    # Enforce the final 1500 character window slice cap
     return result[:1500]
