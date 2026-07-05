@@ -59,7 +59,8 @@ from scraper import scrape_website, build_feature_string
 # ─────────────────────────────────────────────
 HF_MODEL_ID = "SanandaDutta/website-category-distilbert"
 
-HF_SPACE_URL = "https://sanandadutta-wcc-inference-relay.hf.space/classify"
+#HF_SPACE_URL = "https://sanandadutta-wcc-inference-relay.hf.space/classify"
+HF_SPACE_URL = os.getenv("HF_SPACE_URL", "https://sanandadutta-wcc-inference-relay.hf.space/classify")
 
 HF_TOKEN = os.getenv("HF_TOKEN", "")
 DB_FILE  = "usage_logs.db"
