@@ -85,7 +85,7 @@ Integrate real-time URL classification into your production application with a s
 ```bash
 curl -X POST "[https://website-category-classifier.p.rapidapi.com/classify/url](https://website-category-classifier.p.rapidapi.com/classify/url)" \
   -H "Content-Type: application/json" \
-  -H "X-RapidAPI-Key: d207a450-3c5c-11f1-baa0-6313b7e20985" \
+  -H "X-RapidAPI-Key: 19459d36b0msh5f8bf9042600944p15d9b0jsnff32ec11ef9a" \
   -H "X-RapidAPI-Host: website-category-classifier.p.rapidapi.com" \
   -d '{"url": "[https://github.com](https://github.com/Sananda-Dutta/website-category-classifier)"}'
 ```
@@ -96,7 +96,7 @@ import requests
 url = "[https://website-category-classifier.p.rapidapi.com/classify/url](https://website-category-classifier.p.rapidapi.com/classify/url)"
 headers = {
     "Content-Type": "application/json",
-    "X-RapidAPI-Key": "YOUR_KEY_HERE",
+    "X-RapidAPI-Key": "19459d36b0msh5f8bf9042600944p15d9b0jsnff32ec11ef9a",
     "X-RapidAPI-Host": "website-category-classifier.p.rapidapi.com"
 }
 payload = {"url": "[https://github.com](https://github.com)"}
