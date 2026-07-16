@@ -2,8 +2,13 @@
 
 [![FastAPI](https://img.shields.io/badge/FastAPI-005571?style=for-the-badge&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![Python](https://img.shields.io/badge/Python-3.11-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org)
-[![Railway](https://img.shields.io/badge/Railway-131415?style=for-the-badge&logo=railway&logoColor=white)](https://railway.app)
+[![Google Cloud Run](https://img.shields.io/badge/Google_Cloud_Run-4285F4?style=for-the-badge&logo=googlecloud&logoColor=white)](https://cloud.google.com/run)
 [![Render](https://img.shields.io/badge/Render-46E3B7?style=for-the-badge&logo=render&logoColor=black)](https://render.com)
+[![HuggingFace](https://img.shields.io/badge/HuggingFace-FFD21E?style=for-the-badge&logo=huggingface&logoColor=black)](https://huggingface.co/)
+[![Playwright](https://img.shields.io/badge/Playwright-45BA4B?style=for-the-badge&logo=playwright&logoColor=white)](https://playwright.dev/)
+[![Browserless](https://img.shields.io/badge/Browserless-000000?style=for-the-badge&logo=googlechrome&logoColor=white)](https://www.browserless.io/)
+[![RapidAPI](https://img.shields.io/badge/RapidAPI-0055DA?style=for-the-badge&logo=rapid&logoColor=white)](https://rapidapi.com/)
+[![UptimeRobot](https://img.shields.io/badge/UptimeRobot-5CDD8B?style=for-the-badge&logo=uptimerobot&logoColor=white)](https://uptimerobot.com/)
 
 Classify any website into one of 11 distinct verticals in real time. A production-grade, high-performance engine built for **ad-tech brand safety**, **contextual targeting**, and **EdTech content filtering** use cases. 
 
