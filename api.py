@@ -844,21 +844,42 @@ async def smart_classify(url: str) -> tuple:
     if domain in DOMAIN_SHORTCUTS:
         cat = DOMAIN_SHORTCUTS[domain]
         return cat, 99.0, [{"category": cat, "confidence": 99.0}], "domain_shortcut"
-
+    
     scraped = {}
     try:
         scraped = scrape_website(url)
-
     except Exception as scrape_err:
         print(f"[SCRAPE FAILED] {url}: {scrape_err}")
         scraped = {"error": "SCRAPE_FAILED"}
 
-    # New: flag non-English content honestly instead of silently guessing
+    # 1. Flag non-English content honestly instead of silently guessing
     if scraped.get("language") and scraped["language"] not in ("en", "unknown"):
         return (
             "Unknown", 0.0,
             [{"category": "Unknown", "confidence": 0.0}],
             f"unsupported_language_{scraped['language']}"
+        )
+
+    # 2. Extract features and set text-substance thresholds dynamically
+    if scraped.get("error"):
+        # Upgrade: Combine the scraped title (if available) with URL words for better fallback data
+        partial_title = scraped.get("title", "")
+        url_words = extract_url_features(url)
+        features = f"{partial_title} {url_words}".strip()
+        
+        method = "url_features_only"
+        min_words = 2          # URL/Title-derived text is inherently short
+    else:
+        features = build_weighted_features(scraped, url)
+        method = "combined_features"
+        min_words = 15         # Real page content should have real substance
+
+    # 3. Fallback check for thin or unextractable content
+    if not features.strip() or len(features.split()) < min_words:
+        return (
+            "Unknown", 0.0,
+            [{"category": "Unknown", "confidence": 0.0}],
+            "unable_to_extract_fallback"
         )
 
     if scraped.get("error"):
