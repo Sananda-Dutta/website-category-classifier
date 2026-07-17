@@ -837,6 +837,7 @@ async def smart_classify(url: str) -> tuple:
     domain = get_domain(url)
     domain_with_path = get_domain_with_path(url)
 
+    # 1. Check Shortcuts
     if domain_with_path in PATH_SHORTCUTS:
         cat = PATH_SHORTCUTS[domain_with_path]
         return cat, 99.0, [{"category": cat, "confidence": 99.0}], "path_shortcut"
@@ -844,7 +845,8 @@ async def smart_classify(url: str) -> tuple:
     if domain in DOMAIN_SHORTCUTS:
         cat = DOMAIN_SHORTCUTS[domain]
         return cat, 99.0, [{"category": cat, "confidence": 99.0}], "domain_shortcut"
-    
+
+    # 2. Trigger the Scraper Engine
     scraped = {}
     try:
         scraped = scrape_website(url)
@@ -852,7 +854,7 @@ async def smart_classify(url: str) -> tuple:
         print(f"[SCRAPE FAILED] {url}: {scrape_err}")
         scraped = {"error": "SCRAPE_FAILED"}
 
-    # 1. Flag non-English content honestly instead of silently guessing
+    # 3. Intercept and flag Non-English sites early
     if scraped.get("language") and scraped["language"] not in ("en", "unknown"):
         return (
             "Unknown", 0.0,
@@ -860,28 +862,7 @@ async def smart_classify(url: str) -> tuple:
             f"unsupported_language_{scraped['language']}"
         )
 
-    # 2. Extract features and set text-substance thresholds dynamically
-    if scraped.get("error"):
-        # Upgrade: Combine the scraped title (if available) with URL words for better fallback data
-        partial_title = scraped.get("title", "")
-        url_words = extract_url_features(url)
-        features = f"{partial_title} {url_words}".strip()
-        
-        method = "url_features_only"
-        min_words = 2          # URL/Title-derived text is inherently short
-    else:
-        features = build_weighted_features(scraped, url)
-        method = "combined_features"
-        min_words = 15         # Real page content should have real substance
-
-    # 3. Fallback check for thin or unextractable content
-    if not features.strip() or len(features.split()) < min_words:
-        return (
-            "Unknown", 0.0,
-            [{"category": "Unknown", "confidence": 0.0}],
-            "unable_to_extract_fallback"
-        )
-
+    # 4. Generate Initial Features
     if scraped.get("error"):
         features = extract_url_features(url)
         method = "url_features_only"
@@ -889,27 +870,37 @@ async def smart_classify(url: str) -> tuple:
         features = build_weighted_features(scraped, url)
         method = "combined_features"
 
-    # ... rest unchanged
-
-    if not features.strip():
-        features = domain.replace(".", " ").replace("-", " ")
-        method   = "domain_name_only"
-    
+    # 5. The Unified Fallback (Triggers on thin text, blocked pages, or sparse extractions)
     if not features.strip() or len(features.split()) < 15:
-        fallback_features = extract_url_features(url)
-        if fallback_features.strip() and len(fallback_features.split()) >= 5:
-            features = fallback_features
-            method = "url_features_fallback"
+        title = scraped.get("title", "")
+        url_feats = extract_url_features(url)
+        combined = f"{title} {url_feats}".strip()
+        
+        if combined and len(combined.split()) >= 2:
+            features = combined
+            method = "url_features_only"
         else:
-            return "Unknown", 0.0, [{"category": "Unknown", "confidence": 0.0}], "unable_to_extract_fallback"
+            # Absolute worst-case scenario: default to splitting the raw domain string
+            domain_fallback = domain.replace(".", " ").replace("-", " ")
+            if domain_fallback.strip():
+                features = domain_fallback
+                method = "domain_name_only"
+            else:
+                return (
+                    "Unknown", 0.0,
+                    [{"category": "Unknown", "confidence": 0.0}],
+                    "unable_to_extract_fallback"
+                )
 
+    # 6. Run the AI Model Prediction (Executed exactly ONCE)
     try:
         category, confidence, top3 = await run_prediction(features)
     except HTTPException as he:
         print(f"[HF ERROR in smart_classify] {he.detail}")
         return "Technology", 30.0, [{"category": "Technology", "confidence": 30.0}], "hf_error_fallback"
 
-    # Fallback 1: try URL features alone if confidence is low
+    # 7. Confidence Optimizations & Secondary Fallbacks
+    # Try URL features alone if confidence is weak and we originally scanned full body content
     if confidence < CONFIDENCE_THRESHOLD and method == "combined_features":
         url_features = extract_url_features(url)
         if url_features.strip():
@@ -921,8 +912,7 @@ async def smart_classify(url: str) -> tuple:
             except Exception:
                 pass
 
-    # Fallback 2: keyword rules if still below threshold
-    # FIX v2.7.0: was referencing undefined `extracted_text`, now correctly uses `features`
+    # Keyword Rules Check (Runs if model confidence is still below threshold)
     if confidence < CONFIDENCE_THRESHOLD:
         fallback_cat, fallback_conf = keyword_fallback(features)
         if fallback_cat and fallback_conf >= 30.0:
@@ -937,7 +927,6 @@ async def smart_classify(url: str) -> tuple:
             method = "model"
 
     return category, confidence, top3, method
-
 
 # ─────────────────────────────────────────────
 # SCHEMAS
