@@ -59,7 +59,6 @@ from scraper import scrape_website, build_feature_string
 # ─────────────────────────────────────────────
 HF_MODEL_ID = "SanandaDutta/website-category-distilbert"
 
-#HF_SPACE_URL = "https://sanandadutta-wcc-inference-relay.hf.space/classify"
 HF_SPACE_URL = os.getenv("HF_SPACE_URL", "https://sanandadutta-wcc-inference-relay.hf.space/classify")
 
 HF_TOKEN = os.getenv("HF_TOKEN", "")
@@ -793,7 +792,7 @@ def extract_url_features(url: str) -> str:
         all_parts = domain_words * 3 + path_words + tld_signal.split()
         clean = [
             w.lower() for w in all_parts
-            if len(w) > 2 and w.isalpha() and w.lower() not in NOISE_WORDS
+            if len(w) > 1 and w.isalpha() and w.lower() not in NOISE_WORDS
         ]
         return " ".join(clean)
     except Exception:
@@ -803,39 +802,23 @@ def extract_url_features(url: str) -> str:
 def build_weighted_features(scraped: dict, url: str) -> str:
     parts = []
     try:
-        # 1. Safely pull data from your active scraper dictionary
         title = scraped.get("title", "").strip()
-        meta  = scraped.get("meta_description", "").strip()
-        keywords = scraped.get("keywords", "").strip()
-        
-        # Pull headings and paragraph strings
-        h1_h2_h3 = scraped.get("h1_h2_h3", "").strip() or " ".join([scraped.get("h1", ""), scraped.get("h2", "")]).strip()
-        paragraphs = scraped.get("paragraphs", "").strip()
-        
-        # Read the raw background body copy block
-        body  = scraped.get("body", scraped.get("body_text", "")).strip()
-        
-        # 2. Append them strictly ONE time each (NO multiplication lists!)
-        if title:      parts.append(title)
-        if meta:       parts.append(meta)
-        if keywords:   parts.append(keywords)
-        if h1_h2_h3:   parts.append(h1_h2_h3)
-        if paragraphs: parts.append(paragraphs)
-        
-        # 3. Match the 3000-character body snapshot parsing limit
-        if body:       
+        # Your scraper returns body text under "data", not "body"/"body_text"
+        body = scraped.get("data", scraped.get("body", scraped.get("body_text", ""))).strip()
+
+        if title:
+            parts.append(title)
+        if body:
             parts.append(body[:3000])
-            
+
     except Exception:
         return extract_url_features(url)
-    
-    # 4. Standardize text structure transformations (regex cleaning rules)
+
     result = " ".join(parts)
-    result = re.sub(r'http\S+', '', result)   # drop links
-    result = re.sub(r'[^\w\s]', ' ', result)   # drop symbols
+    result = re.sub(r'http\S+', '', result)
+    result = re.sub(r'[^\w\s]', ' ', result)
     result = re.sub(r'\s+', ' ', result).strip().lower()
-    
-    # 5. Cap the total feature payload output string precisely at 1500 chars
+
     words = result[:1500].split()
     return " ".join(w for w in words if w not in NOISE_WORDS and len(w) > 2)
 
@@ -878,13 +861,12 @@ async def smart_classify(url: str) -> tuple:
         method   = "domain_name_only"
     
     if not features.strip() or len(features.split()) < 15:
-        # Returning a tuple to perfectly match your existing smart_classify structure:
-        return (
-            "Unknown", 
-            0.0, 
-            [{"category": "Unknown", "confidence": 0.0}], 
-            "unable_to_extract_fallback"
-        )
+        fallback_features = extract_url_features(url)
+        if fallback_features.strip() and len(fallback_features.split()) >= 5:
+            features = fallback_features
+            method = "url_features_fallback"
+        else:
+            return "Unknown", 0.0, [{"category": "Unknown", "confidence": 0.0}], "unable_to_extract_fallback"
 
     try:
         category, confidence, top3 = await run_prediction(features)
