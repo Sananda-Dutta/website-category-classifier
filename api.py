@@ -774,40 +774,48 @@ NOISE_WORDS = {
     "how","its","may","who","did","let","put","too","way",
     "com","www","http","https","html","php","asp","net","org",
 }
-
+  
 def extract_url_features(url: str) -> str:
     try:
-        parsed       = urlparse(url if url.startswith("http") else "http://" + url)
-        domain       = parsed.netloc.replace("www.", "")
-        path         = parsed.path
-        tld          = domain.split(".")[-1] if "." in domain else ""
+        parsed = urlparse(url if url.startswith("http") else "http://" + url)
+        domain = parsed.netloc.replace("www.", "")
+        path = parsed.path
+        tld = domain.split(".")[-1] if "." in domain else ""
         domain_words = re.split(r'[.\-_]', domain)
-        path_words   = re.split(r'[/\-_.]', path)
-        tld_signal   = {
+        path_words = re.split(r'[/\-_.]', path)
+        tld_signal = {
             "edu": "education university college academic",
             "gov": "government official public authority",
             "org": "organization nonprofit charity",
-            "ac":  "academic university college",
+            "ac": "academic university college",
         }.get(tld, "")
         all_parts = domain_words * 3 + path_words + tld_signal.split()
         clean = [
             w.lower() for w in all_parts
-            if len(w) > 1 and w.isalpha() and w.lower() not in NOISE_WORDS
+            if len(w) > 1 and w.isalpha() and w.lower() not in NOISE_WORDS   # was > 2
         ]
         return " ".join(clean)
     except Exception:
         return ""
-
-
+    
 def build_weighted_features(scraped: dict, url: str) -> str:
     parts = []
     try:
         title = scraped.get("title", "").strip()
-        # Your scraper returns body text under "data", not "body"/"body_text"
-        body = scraped.get("data", scraped.get("body", scraped.get("body_text", ""))).strip()
+        meta = scraped.get("meta_description", "").strip()
+        og_meta = scraped.get("og_description", "").strip()
+        headings = scraped.get("headings", "").strip()
+        # Prefer trafilatura's clean extraction; fall back to raw innerText
+        body = scraped.get("clean_text", "").strip() or scraped.get("data", "").strip()
 
         if title:
             parts.append(title)
+        if meta:
+            parts.append(meta)
+        elif og_meta:                # only use OG desc if no meta description exists
+            parts.append(og_meta)
+        if headings:
+            parts.append(headings)
         if body:
             parts.append(body[:3000])
 
@@ -826,11 +834,7 @@ def build_weighted_features(scraped: dict, url: str) -> str:
 # SMART CLASSIFY
 # ─────────────────────────────────────────────
 async def smart_classify(url: str) -> tuple:
-    """
-    Returns (category, confidence, top3, method).
-    Shortcuts served locally (0 ms). Unknown domains call HF Space.
-    """
-    domain           = get_domain(url)
+    domain = get_domain(url)
     domain_with_path = get_domain_with_path(url)
 
     if domain_with_path in PATH_SHORTCUTS:
@@ -841,20 +845,30 @@ async def smart_classify(url: str) -> tuple:
         cat = DOMAIN_SHORTCUTS[domain]
         return cat, 99.0, [{"category": cat, "confidence": 99.0}], "domain_shortcut"
 
-    # Try scraping
     scraped = {}
     try:
         scraped = scrape_website(url)
+
     except Exception as scrape_err:
         print(f"[SCRAPE FAILED] {url}: {scrape_err}")
         scraped = {"error": "SCRAPE_FAILED"}
 
+    # New: flag non-English content honestly instead of silently guessing
+    if scraped.get("language") and scraped["language"] not in ("en", "unknown"):
+        return (
+            "Unknown", 0.0,
+            [{"category": "Unknown", "confidence": 0.0}],
+            f"unsupported_language_{scraped['language']}"
+        )
+
     if scraped.get("error"):
         features = extract_url_features(url)
-        method   = "url_features_only"
+        method = "url_features_only"
     else:
         features = build_weighted_features(scraped, url)
-        method   = "combined_features"
+        method = "combined_features"
+
+    # ... rest unchanged
 
     if not features.strip():
         features = domain.replace(".", " ").replace("-", " ")
