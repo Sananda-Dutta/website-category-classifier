@@ -72,7 +72,7 @@ CLASS_NAMES = [
 ADULT_CATEGORIES     = {"Adult"}
 KIDS_CATEGORY        = "Kids"
 SAFE_FOR_KIDS        = {"Education", "Kids", "Arts", "Recreation"}
-CONFIDENCE_THRESHOLD = 45.0
+CONFIDENCE_THRESHOLD = 25.0
 
 # Shared async HTTP client
 _hf_client: httpx.AsyncClient = None
@@ -805,19 +805,23 @@ def build_weighted_features(scraped: dict, url: str) -> str:
         meta = scraped.get("meta_description", "").strip()
         og_meta = scraped.get("og_description", "").strip()
         headings = scraped.get("headings", "").strip()
-        # Prefer trafilatura's clean extraction; fall back to raw innerText
         body = scraped.get("clean_text", "").strip() or scraped.get("data", "").strip()
+
+        # Meta description is site-owner-written, high-signal — repeat it
+        # so it isn't diluted into irrelevance by longer, noisier body text
+        if meta:
+            parts.append(meta)
+            parts.append(meta)   # weighted 2x
+        elif og_meta:
+            parts.append(og_meta)
+            parts.append(og_meta)
 
         if title:
             parts.append(title)
-        if meta:
-            parts.append(meta)
-        elif og_meta:                # only use OG desc if no meta description exists
-            parts.append(og_meta)
         if headings:
             parts.append(headings)
         if body:
-            parts.append(body[:3000])
+            parts.append(body[:2000])   # slightly reduced cap, meta now carries more weight
 
     except Exception:
         return extract_url_features(url)
@@ -901,6 +905,8 @@ async def smart_classify(url: str) -> tuple:
 
     # 7. Confidence Optimizations & Secondary Fallbacks
     # Try URL features alone if confidence is weak and we originally scanned full body content
+    # 7. Confidence Optimizations & Secondary Fallbacks
+    # Try URL features alone if confidence is weak and we originally scanned full body content
     if confidence < CONFIDENCE_THRESHOLD and method == "combined_features":
         url_features = extract_url_features(url)
         if url_features.strip():
@@ -912,8 +918,11 @@ async def smart_classify(url: str) -> tuple:
             except Exception:
                 pass
 
-    # Keyword Rules Check (Runs if model confidence is still below threshold)
-    if confidence < CONFIDENCE_THRESHOLD:
+    # --- UPDATED KEYWORD OVERRIDE AND LABELING LOGIC ---
+    KEYWORD_OVERRIDE_THRESHOLD = 15.0
+
+    if confidence < KEYWORD_OVERRIDE_THRESHOLD:
+        # The model is completely lost (under 15%), allow keywords to step in
         fallback_cat, fallback_conf = keyword_fallback(features)
         if fallback_cat and fallback_conf >= 30.0:
             category   = fallback_cat
@@ -922,7 +931,14 @@ async def smart_classify(url: str) -> tuple:
         else:
             if method != "url_features_fallback":
                 method = "model_low_confidence"
+                
+    elif confidence < CONFIDENCE_THRESHOLD:
+        # The model is moderately unsure (15% - 45%), but we TRUST the AI model over keywords!
+        if method != "url_features_fallback":
+            method = "model_low_confidence"
+            
     else:
+        # High confidence match
         if method != "url_features_fallback":
             method = "model"
 
